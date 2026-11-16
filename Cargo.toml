@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/airdrop", "crates/airdrop-helper", "crates/airdrop-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/TurcanS/samara"
+homepage = "https://github.com/TurcanS/samara"
+keywords = ["airdrop", "awdl", "linux", "wifi"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# No `panic = "abort"`: the helper's teardown runs from `Drop` and must run on a panic too.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

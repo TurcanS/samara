@@ -1,0 +1,53 @@
+# Build output
+/target/
+packaging/dist/
+packaging/pkg/
+packaging/src/
+packaging/owl/
+packaging/radiotap/
+packaging/googletest/
+packaging/*.pkg.tar.*
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+
+# Fetched or built third-party sources (scripts/build-owl.sh, scripts/mt7921-build.sh)
+/vendor/
+
+# Lab data: captures, dumps, traces. They contain MAC addresses, device names,
+# contact hashes and identity records. Never commit them.
+/probe/
+*.pcap
+*.pcapng
+*.btsnoop
+*.der
+btmon*.txt
+
+# Apple firmware and anything extracted from it
+/re/
+*.ipsw
+*.dmg
+
+# Private notes
+/notes/
+docs/HANDOFF.md
+docs/HISTORY.md
+docs/PROGRESS.md
+docs/RE-NOTES.md
+
+# Python (test suite, analysis scripts)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editors, tools, OS
+.claude/
+.idea/
+.vscode/
+*.swp
+.DS_Store

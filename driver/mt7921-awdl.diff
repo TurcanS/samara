@@ -1,0 +1,373 @@
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+index fb8654b7c..057bd93ed 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+@@ -269,6 +269,9 @@ int mt7921_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ void mt7921_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 			   struct ieee80211_sta *sta);
+ void mt7921_mac_reset_work(struct work_struct *work);
++void mt7921e_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
++			  struct sk_buff *skb, u32 *info);
++void mt7921e_awdl_ba_cancel(struct mt792x_dev *dev);
+ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
+ 			   struct ieee80211_sta *sta,
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/pci.c b/drivers/net/wireless/mediatek/mt76/mt7921/pci.c
+index 7728c5ae6..9aa11ed3a 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/pci.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/pci.c
+@@ -271,7 +271,7 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
+ 		.tx_prepare_skb = mt7921e_tx_prepare_skb,
+ 		.tx_complete_skb = mt76_connac_tx_complete_skb,
+ 		.rx_check = mt7921_rx_check,
+-		.rx_skb = mt7921_queue_rx_skb,
++		.rx_skb = mt7921e_queue_rx_skb,
+ 		.rx_poll_complete = mt792x_rx_poll_complete,
+ 		.sta_add = mt7921_mac_sta_add,
+ 		.sta_event = mt7921_mac_sta_event,
+@@ -452,6 +452,7 @@ static void mt7921_pci_remove(struct pci_dev *pdev)
+ 	if (of_property_read_bool(dev->mt76.dev->of_node, "wakeup-source"))
+ 		device_init_wakeup(dev->mt76.dev, false);
+ 
++	mt7921e_awdl_ba_cancel(dev);
+ 	mt7921e_unregister_device(dev);
+ 	set_bit(MT76_REMOVED, &mdev->phy.state);
+ 	devm_free_irq(&pdev->dev, pdev->irq, dev);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/pci_mac.c b/drivers/net/wireless/mediatek/mt76/mt7921/pci_mac.c
+index 0db7acb3a..e1406308b 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/pci_mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/pci_mac.c
+@@ -5,6 +5,207 @@
+ #include "../dma.h"
+ #include "../mt76_connac2_mac.h"
+ 
++/* Samara (E-TXAGG, second build): aggregate what user space injects to an AWDL peer
++ * that it registered as a station of our access-point interface.
++ *
++ * The Block Ack session is negotiated by user space (OWL), in AWDL's own frame format, which
++ * mac80211 neither sends nor accepts. This driver only watches for the peer's answer: an
++ * ADDBA response with status 0 from a station switches the firmware's originator Block Ack
++ * for that station and TID on, a DELBA from the recipient switches it off. Injected QoS data
++ * without a rate then goes out with the firmware's rate control and aggregation, numbered by
++ * user space. mac80211's own session start is kept away from these stations.
++ * Off by default; /sys/module/mt7921e/parameters/awdl_ba switches it per session.
++ */
++static bool mt7921e_awdl_ba;
++module_param_named(awdl_ba, mt7921e_awdl_ba, bool, 0644);
++MODULE_PARM_DESC(awdl_ba, "Block Ack towards AWDL peers registered as stations (Samara)");
++
++/* Width of those frames: 0 leaves it to the firmware (it stayed at 20 MHz on 2026-11-16 with
++ * an 80 MHz access point and a VHT80 station), 1 = 40 MHz, 2 = 80 MHz, never wider than the
++ * station's own width. Only the width is fixed; the rate stays the firmware's.
++ */
++static unsigned int mt7921e_awdl_bw;
++module_param_named(awdl_bw, mt7921e_awdl_bw, uint, 0644);
++MODULE_PARM_DESC(awdl_bw, "Width of aggregated frames to AWDL stations: 0 firmware, 1 = 40 MHz, 2 = 80 MHz");
++
++static const u8 mt7921e_awdl_bssid[ETH_ALEN] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++
++#define MT7921E_AWDL_BA_SLOTS	8
++
++struct mt7921e_awdl_ba_req {
++	bool used;
++	bool enable;
++	u16 wcid;
++	u8 tid;
++	u16 buf_size;
++};
++
++static DEFINE_SPINLOCK(mt7921e_awdl_ba_lock);
++static struct mt7921e_awdl_ba_req mt7921e_awdl_ba_reqs[MT7921E_AWDL_BA_SLOTS];
++static struct mt792x_dev *mt7921e_awdl_ba_dev;
++
++static void mt7921e_awdl_ba_work_fn(struct work_struct *work)
++{
++	struct mt7921e_awdl_ba_req reqs[MT7921E_AWDL_BA_SLOTS];
++	struct mt792x_dev *dev;
++	struct ieee80211_hw *hw;
++	int i;
++
++	spin_lock_bh(&mt7921e_awdl_ba_lock);
++	memcpy(reqs, mt7921e_awdl_ba_reqs, sizeof(reqs));
++	memset(mt7921e_awdl_ba_reqs, 0, sizeof(mt7921e_awdl_ba_reqs));
++	dev = mt7921e_awdl_ba_dev;
++	spin_unlock_bh(&mt7921e_awdl_ba_lock);
++	if (!dev)
++		return;
++
++	hw = mt76_hw(dev);
++	/* stations are added and removed under the wiphy lock: the entry stays while we hold it */
++	wiphy_lock(hw->wiphy);
++	for (i = 0; i < MT7921E_AWDL_BA_SLOTS; i++) {
++		struct ieee80211_ampdu_params params = {};
++		struct ieee80211_sta *sta;
++		struct mt792x_sta *msta;
++		struct mt76_wcid *wcid;
++		int ret;
++
++		if (!reqs[i].used)
++			continue;
++
++		rcu_read_lock();
++		wcid = rcu_dereference(dev->mt76.wcid[reqs[i].wcid]);
++		sta = wcid_to_sta(wcid);
++		rcu_read_unlock();
++		if (!sta || !sta->txq[reqs[i].tid])
++			continue;
++
++		msta = (struct mt792x_sta *)sta->drv_priv;
++		params.sta = sta;
++		params.tid = reqs[i].tid;
++		params.buf_size = reqs[i].buf_size;
++		params.amsdu = false;
++
++		mt792x_mutex_acquire(dev);
++		msta->deflink.wcid.amsdu = false;
++		ret = mt76_connac_mcu_sta_ba(&dev->mt76, &msta->vif->bss_conf.mt76, &params,
++					     MCU_UNI_CMD(STA_REC_UPDATE), reqs[i].enable, true);
++		mt792x_mutex_release(dev);
++
++		dev_info(dev->mt76.dev, "awdl_ba: %pM tid %u: aggregation %s (window %u)%s\n",
++			 sta->addr, reqs[i].tid, reqs[i].enable ? "on" : "off", reqs[i].buf_size,
++			 ret ? ", firmware refused" : "");
++	}
++	wiphy_unlock(hw->wiphy);
++}
++
++static DECLARE_WORK(mt7921e_awdl_ba_work, mt7921e_awdl_ba_work_fn);
++
++void mt7921e_awdl_ba_cancel(struct mt792x_dev *dev)
++{
++	spin_lock_bh(&mt7921e_awdl_ba_lock);
++	if (mt7921e_awdl_ba_dev == dev)
++		mt7921e_awdl_ba_dev = NULL;
++	memset(mt7921e_awdl_ba_reqs, 0, sizeof(mt7921e_awdl_ba_reqs));
++	spin_unlock_bh(&mt7921e_awdl_ba_lock);
++	cancel_work_sync(&mt7921e_awdl_ba_work);
++}
++
++static void mt7921e_awdl_ba_queue(struct mt792x_dev *dev, u16 wcid, u8 tid, u16 buf_size, bool enable)
++{
++	int i, slot = -1;
++
++	spin_lock_bh(&mt7921e_awdl_ba_lock);
++	for (i = 0; i < MT7921E_AWDL_BA_SLOTS; i++) {
++		struct mt7921e_awdl_ba_req *r = &mt7921e_awdl_ba_reqs[i];
++
++		if (r->used && r->wcid == wcid && r->tid == tid) {
++			slot = i; /* the newer answer wins */
++			break;
++		}
++		if (!r->used && slot < 0)
++			slot = i;
++	}
++	if (slot >= 0) {
++		mt7921e_awdl_ba_reqs[slot] = (struct mt7921e_awdl_ba_req){
++			.used = true, .enable = enable, .wcid = wcid, .tid = tid, .buf_size = buf_size,
++		};
++		mt7921e_awdl_ba_dev = dev;
++	}
++	spin_unlock_bh(&mt7921e_awdl_ba_lock);
++	if (slot >= 0)
++		schedule_work(&mt7921e_awdl_ba_work);
++}
++
++void mt7921e_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
++			  struct sk_buff *skb, u32 *info)
++{
++	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
++	struct mt76_rx_status *status;
++	struct ieee80211_hdr *hdr;
++	struct sk_buff *tail;
++	struct mt76_wcid *wcid;
++	const u8 *body;
++	int room;
++
++	mt7921_queue_rx_skb(mdev, q, skb, info);
++	if (likely(!mt7921e_awdl_ba))
++		return;
++
++	/* A received frame is now the last one waiting for mt76_rx_poll_complete();
++	 * anything else was consumed or freed and must not be touched. Read only.
++	 */
++	tail = skb_peek_tail(&mdev->rx_skb[q]);
++	if (!tail || tail != skb)
++		return;
++
++	status = (struct mt76_rx_status *)tail->cb;
++	if (status->flag & RX_FLAG_8023)
++		return;
++
++	hdr = mt76_skb_get_hdr(tail);
++	room = tail->len - ((u8 *)hdr - tail->data);
++	if (room < 24 + 6 || !ieee80211_is_action(hdr->frame_control) ||
++	    ieee80211_has_protected(hdr->frame_control) ||
++	    is_multicast_ether_addr(hdr->addr1) ||
++	    !ether_addr_equal(hdr->addr3, mt7921e_awdl_bssid))
++		return;
++
++	body = (const u8 *)hdr + 24;
++	if (body[0] != WLAN_CATEGORY_BACK)
++		return;
++
++	wcid = status->wcid;
++	if (!wcid || !wcid->sta) {
++		/* the hardware did not match the sender to its table entry: look it up */
++		struct ieee80211_sta *sta;
++
++		sta = ieee80211_find_sta_by_ifaddr(mt76_hw(dev), hdr->addr2, hdr->addr1);
++		if (!sta)
++			return;
++		wcid = (struct mt76_wcid *)sta->drv_priv;
++	}
++
++	if (body[1] == WLAN_ACTION_ADDBA_RESP && room >= 24 + 9) {
++		/* token, status (2), parameters (2), timeout (2) */
++		u16 st = get_unaligned_le16(body + 3);
++		u16 capab = get_unaligned_le16(body + 5);
++		u8 tid = (capab >> 2) & 0xf;
++		u16 buf_size = capab >> 6;
++
++		if (st == WLAN_STATUS_SUCCESS && tid < 8) {
++			if (!buf_size || buf_size > 64)
++				buf_size = 64;
++			mt7921e_awdl_ba_queue(dev, wcid->idx, tid, buf_size, true);
++		}
++	} else if (body[1] == WLAN_ACTION_DELBA) {
++		/* parameters (2): initiator bit 11, TID bits 12-15; reason (2) */
++		u16 params = get_unaligned_le16(body + 2);
++
++		if (!(params & BIT(11)) && (params >> 12) < 8)
++			mt7921e_awdl_ba_queue(dev, wcid->idx, params >> 12, 0, false);
++	}
++}
++
+ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
+ 			   struct ieee80211_sta *sta,
+@@ -15,6 +216,12 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 	struct ieee80211_key_conf *key = info->control.hw_key;
+ 	struct mt76_connac_hw_txp *txp;
+ 	struct mt76_txwi_cache *t;
++	bool use_minrate = info->flags & IEEE80211_TX_CTL_USE_MINRATE;
++	bool injected_legacy = false;
++	bool injected_ht = false;
++	u8 awdl_bw = 0;
++	u8 injected_bw = 0, injected_sgi = 0;
++	u16 injected_rate = 0;
+ 	int id, pid;
+ 	u8 *txwi = (u8 *)txwi_ptr;
+ 
+@@ -31,6 +238,26 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 	if (id < 0)
+ 		return id;
+ 
++	if (unlikely(mt7921e_awdl_ba) && sta &&
++	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)) {
++		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)tx_info->skb->data;
++
++		/* Injected QoS data without a rate: the firmware's own rate control and
++		 * aggregation carry it. mac80211 asks for a TX status report on every
++		 * injected frame; one per frame is not wanted here (the block below still
++		 * asks four times a second). The bit keeps mt76_connac2_tx_check_aggr()
++		 * from starting mac80211's session, which user space runs instead.
++		 */
++		if ((info->flags & IEEE80211_TX_CTL_INJECTED) &&
++		    !(info->control.flags & IEEE80211_TX_CTRL_RATE_INJECT) &&
++		    ieee80211_is_data_qos(hdr->frame_control)) {
++			info->flags &= ~IEEE80211_TX_CTL_REQ_TX_STATUS;
++			set_bit(ieee80211_get_tid(hdr), &wcid->ampdu_state);
++			awdl_bw = min_t(unsigned int, mt7921e_awdl_bw,
++					min_t(unsigned int, sta->deflink.bandwidth, 2));
++		}
++	}
++
+ 	if (sta) {
+ 		struct mt792x_sta *msta = (struct mt792x_sta *)sta->drv_priv;
+ 
+@@ -40,10 +267,85 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 		}
+ 	}
+ 
++	/* Save the rate before TX status bookkeeping clears control.flags. */
++	if ((mt76_chip(mdev) == 0x7961 || is_mt7920(mdev) || is_mt7922(mdev)) &&
++	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
++	    (info->flags & IEEE80211_TX_CTL_INJECTED) &&
++	    (info->control.flags & IEEE80211_TX_CTRL_RATE_INJECT) &&
++	    !(info->control.rates[0].flags &
++	      (IEEE80211_TX_RC_MCS | IEEE80211_TX_RC_VHT_MCS)) &&
++	    info->band < NUM_NL80211_BANDS) {
++		struct ieee80211_supported_band *sband;
++		int idx = info->control.rates[0].idx;
++
++		sband = mdev->phy.hw->wiphy->bands[info->band];
++		if (sband && idx >= 0 && idx < sband->n_bitrates) {
++			struct ieee80211_rate *r = &sband->bitrates[idx];
++			u16 hw_rate = r->hw_value;
++
++			if (info->control.rates[0].flags & IEEE80211_TX_RC_USE_SHORT_PREAMBLE)
++				hw_rate = r->hw_value_short;
++			injected_rate = FIELD_PREP(MT_TX_RATE_MODE, hw_rate >> 8) |
++					FIELD_PREP(MT_TX_RATE_IDX, hw_rate & 0xff);
++			injected_legacy = true;
++		}
++	}
++
++	/* Samara: the same for an injected HT rate (radiotap MCS 0-15, with
++	 * 40 MHz and short GI as asked). Mode/index/NSS as mt7915's test mode
++	 * writes a fixed HT rate. Without this an HT request falls back to the
++	 * firmware's basic rate (~6 Mbit/s).
++	 */
++	if ((mt76_chip(mdev) == 0x7961 || is_mt7920(mdev) || is_mt7922(mdev)) &&
++	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
++	    (info->flags & IEEE80211_TX_CTL_INJECTED) &&
++	    (info->control.flags & IEEE80211_TX_CTRL_RATE_INJECT) &&
++	    (info->control.rates[0].flags & IEEE80211_TX_RC_MCS) &&
++	    !(info->control.rates[0].flags & IEEE80211_TX_RC_VHT_MCS)) {
++		int mcs = info->control.rates[0].idx;
++
++		if (mcs >= 0 && mcs <= 15) {
++			injected_rate = FIELD_PREP(MT_TX_RATE_MODE, MT_PHY_TYPE_HT) |
++					FIELD_PREP(MT_TX_RATE_IDX, mcs) |
++					FIELD_PREP(MT_TX_RATE_NSS, mcs >> 3);
++			injected_bw = !!(info->control.rates[0].flags &
++					 IEEE80211_TX_RC_40_MHZ_WIDTH);
++			injected_sgi = !!(info->control.rates[0].flags &
++					  IEEE80211_TX_RC_SHORT_GI);
++			injected_legacy = true;
++			injected_ht = true;
++		}
++	}
++
+ 	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
++	/* Let the common builder apply all fixed-rate descriptor settings. */
++	if (injected_legacy)
++		info->flags |= IEEE80211_TX_CTL_USE_MINRATE;
+ 	mt76_connac2_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, key,
+ 				    pid, qid, 0);
+ 
++	if (injected_legacy) {
++		__le32 *txd = txwi_ptr;
++
++		if (!use_minrate)
++			info->flags &= ~IEEE80211_TX_CTL_USE_MINRATE;
++		txd[6] &= ~cpu_to_le32(MT_TXD6_TX_RATE);
++		txd[6] |= cpu_to_le32(FIELD_PREP(MT_TXD6_TX_RATE, injected_rate));
++		if (injected_ht) {
++			txd[6] &= ~cpu_to_le32(MT_TXD6_BW | MT_TXD6_SGI);
++			txd[6] |= cpu_to_le32(MT_TXD6_FIXED_BW |
++					      FIELD_PREP(MT_TXD6_BW, injected_bw) |
++					      FIELD_PREP(MT_TXD6_SGI, injected_sgi));
++		}
++	}
++
++	if (awdl_bw) {
++		__le32 *txd = txwi_ptr;
++
++		txd[6] &= ~cpu_to_le32(MT_TXD6_BW);
++		txd[6] |= cpu_to_le32(MT_TXD6_FIXED_BW | FIELD_PREP(MT_TXD6_BW, awdl_bw));
++	}
++
+ 	txp = (struct mt76_connac_hw_txp *)(txwi + MT_TXD_SIZE);
+ 	memset(txp, 0, sizeof(struct mt76_connac_hw_txp));
+ 	mt76_connac_write_hw_txp(mdev, tx_info, txp, id);

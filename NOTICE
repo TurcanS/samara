@@ -1,0 +1,18 @@
+Samara: AirDrop for Linux
+Licensed under the GNU General Public License, version 3 or (at your option) any later version. See LICENSE.
+
+This repository contains patches against other projects. Each patch carries the license of the code it changes.
+
+packaging/owl-airdrop.patch
+    Changes to OWL (Open Wireless Link), https://github.com/seemoo-lab/owl
+    Copyright of OWL: its authors (SEEMOO Lab, TU Darmstadt). GPL-3.0.
+
+driver/mt7921-awdl.diff
+    Changes to the Linux kernel's mt76 driver (drivers/net/wireless/mediatek/mt76/mt7921).
+    GPL-2.0, as the kernel. The injected-rate part is derived from
+    https://github.com/shaecodes-wilde/mt76 (branch fix/mt7921-family-driver).
+
+Neither OWL nor the kernel sources are distributed here; the build scripts fetch them from upstream.
+
+AirDrop, AWDL, iPhone, iPad and Mac are trademarks of Apple Inc. This project is not affiliated with,
+sponsored by or endorsed by Apple.

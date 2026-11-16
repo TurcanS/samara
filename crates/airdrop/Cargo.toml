@@ -1,0 +1,32 @@
+[package]
+name = "airdrop"
+description = "Samara: AirDrop for Linux. Send and receive with Apple devices over AWDL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "airdrop"
+path = "src/main.rs"
+
+[dependencies]
+airdrop-proto = { path = "../airdrop-proto" }
+base64 = "0.23"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+libc = "0.2"
+openssl = "0.10"
+plist = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "signal", "sync", "process"] }
+tokio-openssl = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
+toml = "1"
+zbus = "5"
+
+[lints]
+workspace = true

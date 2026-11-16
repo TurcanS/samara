@@ -1,0 +1,23 @@
+# Background AirDrop receiver (not enabled by default).
+#
+# Runs `airdrop listen`: Wi-Fi stays connected and only Bluetooth is watched. When an
+# iPhone nearby opens Share -> AirDrop, Wi-Fi is paused for the transfer and reconnects
+# afterwards. Every transfer is asked about in a desktop notification (needs libnotify);
+# no answer is a decline.
+#
+# Requirements:
+#   - the polkit rule in 50-airdrop-background.rules.example (no password prompt possible here)
+#
+#   systemctl --user enable --now airdrop-receive.service
+[Unit]
+Description=AirDrop receiver (visible to nearby Apple devices when they open AirDrop)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/airdrop listen --ask --prompter notify
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

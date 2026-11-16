@@ -1,0 +1,60 @@
+# Build from the source tree:  cd packaging && makepkg -si
+pkgname=samara
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="AirDrop for Linux: send and receive with Apple devices over AWDL (OWL)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/TurcanS/samara"
+license=('GPL-3.0-or-later')
+# airdrop: openssl. airdrop-helper runs iw, ip, nmcli, resolvectl and modinfo, and talks
+# to NetworkManager and BlueZ over D-Bus. owl: libpcap, libev, libnl.
+depends=('openssl' 'zlib' 'polkit' 'iw' 'iproute2' 'networkmanager' 'bluez' 'systemd' 'kmod'
+         'libpcap' 'libev' 'libnl')
+optdepends=('notification-daemon: desktop notifications, and the accept question of --prompter notify')
+makedepends=('git' 'cmake' 'cargo')
+provides=('airdrop-linux')
+conflicts=('airdrop-linux')
+replaces=('airdrop-linux')
+options=('!lto')  # the Rust profile sets its own (thin) LTO
+_owlcommit=0ee3263f944ea721c355f826aa90d636d012a512
+source=("owl::git+https://github.com/seemoo-lab/owl.git#commit=${_owlcommit}"
+        "radiotap::git+https://github.com/radiotap/radiotap-library.git"
+        "googletest::git+https://github.com/google/googletest.git")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+_tree() { realpath "$startdir/.."; }
+
+prepare() {
+  cd owl
+  git submodule init
+  git config submodule.radiotap.url "$srcdir/radiotap"
+  git config submodule.googletest.url "$srcdir/googletest"
+  git -c protocol.file.allow=always submodule update
+  git apply "$startdir/owl-airdrop.patch"
+
+  cd "$(_tree)"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cmake -S owl -B owl-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  cmake --build owl-build --target owl
+
+  cargo build --frozen --release --manifest-path "$(_tree)/Cargo.toml" --target-dir "$srcdir/target" \
+    -p airdrop -p airdrop-helper
+}
+
+package() {
+  local tree; tree=$(_tree)
+  install -Dm755 target/release/airdrop "$pkgdir/usr/bin/airdrop"
+  install -Dm755 target/release/airdrop-helper "$pkgdir/usr/lib/airdrop/airdrop-helper"
+  install -Dm755 owl-build/daemon/owl "$pkgdir/usr/lib/airdrop/owl"
+  install -Dm644 "$tree/packaging/org.airdrop.helper.policy" \
+    "$pkgdir/usr/share/polkit-1/actions/org.airdrop.helper.policy"
+  install -Dm644 "$tree/packaging/airdrop-receive.service" \
+    "$pkgdir/usr/lib/systemd/user/airdrop-receive.service"
+  install -Dm644 "$tree/packaging/50-airdrop-background.rules.example" \
+    "$pkgdir/usr/share/doc/$pkgname/50-airdrop-background.rules.example"
+  install -Dm644 "$tree/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "$tree/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+}

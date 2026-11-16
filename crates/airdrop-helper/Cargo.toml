@@ -1,0 +1,18 @@
+[package]
+name = "airdrop-helper"
+description = "Samara: root half of the Linux AirDrop client: radio, NetworkManager, BlueZ, OWL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zbus = "5"
+
+[lints]
+workspace = true

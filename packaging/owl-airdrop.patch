@@ -1,0 +1,1837 @@
+diff --git a/daemon/core.c b/daemon/core.c
+index 8b17ede..cb55937 100644
+--- a/daemon/core.c
++++ b/daemon/core.c
+@@ -70,7 +70,11 @@ void wlan_device_ready(struct ev_loop *loop, ev_io *handle, int revents) {
+ static int poll_host_device(struct daemon_state *state) {
+ 	struct buf *buf = NULL;
+ 	int result = 0;
+-	while (!state->next && !circular_buf_full(state->tx_queue_multicast)) {
++	/* Keep reading while a multicast queue is full: stopping here blocked every
++	 * unicast frame behind multicast that could not leave (E0.11 run 2: one
++	 * unicast frame in 120 s with a ch 6 slot only at 8). The oldest multicast
++	 * frame is dropped instead; mDNS repeats itself. */
++	while (!state->next) {
+ 		buf = buf_new_owned(ETHER_MAX_LEN);
+ 		int len = buf_len(buf);
+ 		if (host_recv(&state->io, (uint8_t *) buf_data(buf), &len) < 0) {
+@@ -82,6 +86,13 @@ static int poll_host_device(struct daemon_state *state) {
+ 			READ_ETHER_ADDR(buf, ETHER_DST_OFFSET, &dst);
+ 			is_multicast = dst.ether_addr_octet[0] & 0x01;
+ 			if (is_multicast) {
++				if (circular_buf_full(state->tx_queue_multicast)) {
++					void *oldest = NULL;
++					circular_buf_get(state->tx_queue_multicast, &oldest, 0);
++					if (oldest)
++						buf_free(oldest);
++					state->awdl_state.stats.tx_data_multicast_dropped++;
++				}
+ 				circular_buf_put(state->tx_queue_multicast, buf);
+ 				result |= POLL_NEW_MULTICAST;
+ 			} else { /* unicast */
+@@ -117,11 +128,26 @@ void awdl_receive_frame(uint8_t *user, const struct pcap_pkthdr *hdr, const uint
+ 	struct buf *data_arr[MAX_NUM_AMPDU];
+ 	struct buf **data = &data_arr[0];
+ 	result = awdl_rx(frame, &data, &state->awdl_state);
++	if (state->awdl_state.addba.pending) {
++		/* The peer is on our channel right now (it just asked): answer at once. */
++		uint8_t resp[128];
++		struct awdl_addba_request *req = &state->awdl_state.addba;
++		int len = ieee80211_init_addba_response(resp, &state->awdl_state, &state->ieee80211_state);
++		req->pending = 0;
++		if (len > 0 && wlan_send(&state->io, resp, len) >= 0)
++			log_info("Block Ack: accepted request from %s (tid %d, window %d)", ether_ntoa(&req->peer),
++			         (req->params >> 2) & 0xf, (req->params >> 6) & 0x3ff);
++	}
+ 	if (result == RX_OK) {
+ 		for (struct buf **data_start = &data_arr[0]; data_start < data; data_start++) {
+ 			host_send(&state->io, buf_data(*data_start), buf_len(*data_start));
+ 			buf_free(*data_start);
+ 		}
++	}
++	/* A frame is waiting for its slot and the peer just showed it is here. */
++	if (state->next && state->awdl_state.presence_us && result != RX_IGNORE_FROM_SELF)
++		awdl_send_unicast(state->ev_state.loop, &state->ev_state.tx_timer, 0);
++	if (result == RX_OK) {
+ 	} else if (result < RX_OK) {
+ 		log_warn("unhandled frame (%d)", result);
+ 		dump_frame(state->dump, hdr, buf);
+@@ -130,8 +156,80 @@ void awdl_receive_frame(uint8_t *user, const struct pcap_pkthdr *hdr, const uint
+ 	buf_free(frame);
+ }
+ 
++/* -G: most stations the access-point interface holds at a time (the MT7921 has 20 table
++ * entries in all), and the highest association ID its driver takes. Peers beyond either get
++ * plain frames. */
++#define AWDL_STATIONS_MAX 8
++#define AWDL_STATION_AID_MAX 20
++
++/* Make `peer` a station of the access-point interface, once. Without its HT capabilities (no
++ * MIF heard yet) the attempt is put off; a refusal is remembered and the peer keeps getting
++ * plain frames at OWL's own rate. */
++static void awdl_station_register(struct io_state *io, struct awdl_peer *peer) {
++	int err;
++
++	if (!io->sta_ifindex || peer->is_sta || peer->sta_failed || !peer->has_ht)
++		return;
++	if (io->sta_count >= AWDL_STATIONS_MAX || io->sta_last_aid >= AWDL_STATION_AID_MAX) {
++		peer->sta_failed = 1;
++		return;
++	}
++	err = station_add(io->sta_ifindex, &peer->addr, (uint16_t) ++io->sta_last_aid, peer->ht_cap, peer->ht_ampdu,
++	                  peer->ht_mcs, peer->has_vht ? peer->vht_cap : NULL);
++	if (err < 0) {
++		peer->sta_failed = 1;
++		log_warn("station: could not register %s (%s); it gets single frames", ether_ntoa(&peer->addr),
++		         strerror(-err));
++		return;
++	}
++	io->sta_count++;
++	peer->is_sta = 1;
++	log_info("station: registered %s (HT caps 0x%04x, %d stream%s%s)",
++	         ether_ntoa(&peer->addr), peer->ht_cap, peer->ht_mcs[1] ? 2 : 1, peer->ht_mcs[1] ? "s" : "",
++	         peer->has_vht ? ", VHT" : "");
++}
++
++/* -G: ask a station peer for a Block Ack session (the driver switches the firmware's
++ * aggregation on when it sees the peer agree). Called when a frame is about to go to the peer,
++ * so the peer is on our channel. An iPhone only answers once a transfer is running (3 of 3
++ * requests sent before one went unanswered on 2026-11-16, each one sent during one was
++ * granted), so a request goes out only ahead of a full-size frame, every 2 s until granted.
++ * Data is held for the answer, 50 ms at most: the session starts at the next frame's number.
++ * Until the peer agrees it gets plain frames at OWL's own rate, as without -G.
++ * Returns the seconds to wait before sending data, 0 to send now. */
++#define AWDL_BA_TRIES 60
++#define AWDL_BA_RETRY_US 2000000
++#define AWDL_BA_WAIT_US 50000
++#define AWDL_BA_BULK_LEN 1000
++static double awdl_station_block_ack(struct daemon_state *state, struct awdl_peer *peer, uint64_t now) {
++	if (!peer->is_sta || peer->ba_granted)
++		return 0;
++	if (peer->ba_wait_until > now)
++		return usec_to_sec(peer->ba_wait_until - now);
++	if (peer->ba_wait_until) { /* the wait ran out without an answer */
++		peer->ba_wait_until = 0;
++		log_info("Block Ack: no answer from %s to request %d", ether_ntoa(&peer->addr), 0x40 + peer->ba_tries - 1);
++	}
++	if (buf_len(state->next) >= AWDL_BA_BULK_LEN && peer->ba_tries < AWDL_BA_TRIES &&
++	    (!peer->ba_last || now - peer->ba_last > AWDL_BA_RETRY_US)) {
++		uint8_t req[128];
++		uint8_t token = (uint8_t) (0x40 + peer->ba_tries);
++		int len = ieee80211_init_addba_request(req, &state->awdl_state, &state->ieee80211_state, &peer->addr,
++		                                       token, peer->qos_seq);
++		peer->ba_tries++;
++		peer->ba_last = now;
++		if (len > 0 && wlan_send(&state->io, req, len) >= 0) {
++			peer->ba_wait_until = now + AWDL_BA_WAIT_US;
++			log_info("Block Ack: asked %s (request %d, starting at %d)", ether_ntoa(&peer->addr), token,
++			         peer->qos_seq);
++			return usec_to_sec(AWDL_BA_WAIT_US);
++		}
++	}
++	return 0;
++}
++
+ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+-                   struct awdl_state *awdl_state, struct ieee80211_state *ieee80211_state) {
++                   struct awdl_state *awdl_state, struct ieee80211_state *ieee80211_state, int qos_seq) {
+ 	uint8_t awdl_data[65535];
+ 	int awdl_data_len;
+ 	uint16_t ethertype;
+@@ -146,7 +244,7 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+ 	buf_strip(buf, ETHER_LENGTH);
+ 	awdl_data_len = awdl_init_full_data_frame(awdl_data, &src, &dst,
+ 	                                          buf_data(buf), buf_len(buf),
+-	                                          awdl_state, ieee80211_state);
++	                                          awdl_state, ieee80211_state, qos_seq);
+ 	now = clock_time_us();
+ 	period = awdl_sync_current_eaw(now, &awdl_state->sync) / AWDL_CHANSEQ_LENGTH;
+ 	slot = awdl_sync_current_eaw(now, &awdl_state->sync) % AWDL_CHANSEQ_LENGTH;
+@@ -221,8 +319,33 @@ void awdl_send_unicast(struct ev_loop *loop, ev_timer *timer, int revents) {
+ 			state->next = NULL;
+ 		} else {
+ 			in = awdl_can_send_unicast_in(awdl_state, peer, now, AWDL_UNICAST_GUARD_TU);
+-			if (in == 0) { /* send now */
+-				awdl_send_data(state->next, &state->io, &state->awdl_state, &state->ieee80211_state);
++			if (in == 0) { /* in the peer's slot */
++				if (awdl_state->probe_addba && !state->io.sta_ifindex && awdl_state->probe_addba_sent < 3 &&
++				    now - awdl_state->probe_addba_last > 2000000) {
++					/* in the peer's slot right now: the moment a request can reach it */
++					uint8_t req[128];
++					uint8_t token = (uint8_t) (0x40 + awdl_state->probe_addba_sent);
++					int len = ieee80211_init_addba_request(req, awdl_state, &state->ieee80211_state, &peer->addr,
++					                                       token, -1);
++					awdl_state->probe_addba_sent++;
++					awdl_state->probe_addba_last = now;
++					if (len > 0 && wlan_send(&state->io, req, len) >= 0)
++						log_info("Block Ack probe: sent request %d to %s", token, ether_ntoa(&peer->addr));
++				}
++				awdl_station_register(&state->io, peer);
++				in = awdl_station_block_ack(state, peer, now);
++			}
++			if (in == 0) { /* still: send now */
++				if (awdl_state->presence_us &&
++				    awdl_can_send_unicast_sched_in(awdl_state, peer, now, AWDL_UNICAST_GUARD_TU) != 0)
++					awdl_state->stats.tx_presence++;
++				if (peer->is_sta && peer->ba_granted) {
++					awdl_send_data(state->next, &state->io, &state->awdl_state, &state->ieee80211_state,
++					               peer->qos_seq);
++					peer->qos_seq = (peer->qos_seq + 1) & 0xfff;
++				} else {
++					awdl_send_data(state->next, &state->io, &state->awdl_state, &state->ieee80211_state, -1);
++				}
+ 				buf_free(state->next);
+ 				state->next = NULL;
+ 				state->awdl_state.stats.tx_data_unicast++;
+@@ -255,7 +378,7 @@ void awdl_send_multicast(struct ev_loop *loop, ev_timer *timer, int revents) {
+ 		if (awdl_is_multicast_eaw(awdl_state, now) && (in == 0)) { /* we can send now */
+ 			void *next;
+ 			circular_buf_get(state->tx_queue_multicast, &next, 0);
+-			awdl_send_data((struct buf *) next, &state->io, &state->awdl_state, &state->ieee80211_state);
++			awdl_send_data((struct buf *) next, &state->io, &state->awdl_state, &state->ieee80211_state, -1);
+ 			buf_free(next);
+ 			state->awdl_state.stats.tx_data_multicast++;
+ 		} else { /* try later */
+@@ -294,12 +417,19 @@ void awdl_switch_channel(struct ev_loop *loop, ev_timer *timer, int revents) {
+ 
+ 	if (chan_num_new && (chan_num_new != chan_num_old)) {
+ 		log_debug("switch channel to %d (slot %d)", chan_num_new, slot);
+-		if (!state->io.wlan_is_file) {
+-			bool is_available;
+-			is_channel_available(state->io.wlan_ifindex, chan_num_new, &is_available);
+-			set_channel(state->io.wlan_ifindex, chan_num_new);
++		int err = 0;
++		/* No is_channel_available() here: it is a full wiphy dump that blocks
++		 * the event loop, and its result was ignored. With a followed sequence
++		 * this runs on every slot change. */
++		if (!state->io.wlan_is_file)
++			err = set_channel(state->io.wlan_ifindex, chan_num_new);
++		if (err < 0) {
++			/* e.g. EBUSY while a managed interface owns the channel: the radio
++			 * did not move, so do not pretend it did. */
++			log_debug("radio stays on %d (could not switch to %d)", chan_num_old, chan_num_new);
++		} else {
++			awdl_state->channel.current = chan_new;
+ 		}
+-		awdl_state->channel.current = chan_new;
+ 	}
+ 
+ 	next_aw = awdl_sync_next_aw_us(now, &awdl_state->sync);
+@@ -315,6 +445,68 @@ static void awdl_neighbor_add(struct awdl_peer *p, void *_io_state) {
+ static void awdl_neighbor_remove(struct awdl_peer *p, void *_io_state) {
+ 	struct io_state *io_state = _io_state;
+ 	neighbor_remove_rfc4291(io_state->host_ifindex, &p->addr);
++	if (p->is_sta && io_state->sta_ifindex) {
++		station_del(io_state->sta_ifindex, &p->addr);
++		io_state->sta_count--;
++		log_info("station: removed %s", ether_ntoa(&p->addr));
++	}
++}
++
++/* Copy the elected sync master's channel sequence (with its encoding), so we
++ * are on-channel in its availability windows and advertise a sequence it
++ * accepts. Back to the static sequence when we are our own master again. */
++static void awdl_follow_master_chanseq(struct awdl_state *awdl) {
++	struct awdl_peer *master;
++
++	if (awdl->channel.follow_disabled)
++		return;
++	if (awdl_election_is_sync_master(&awdl->election, &awdl->self_address)) {
++		if (awdl->channel.follows_master) {
++			awdl_chanseq_init_static(awdl->channel.sequence, &awdl->channel.master);
++			awdl->channel.enc = AWDL_CHAN_ENC_OPCLASS;
++			awdl->channel.follows_master = 0;
++			awdl->channel.no_overlap = 0;
++			log_info("no sync master, back to static channel sequence");
++		}
++		return;
++	}
++	if (awdl_peer_get(awdl->peers.peers, &awdl->election.sync_addr, &master) < 0 || !master->has_sequence)
++		return;
++
++	struct awdl_chan seq[AWDL_CHANSEQ_LENGTH];
++	int kept = AWDL_CHANSEQ_LENGTH;
++	if (awdl->channel.intersect) {
++		/* -I: the radio sits on our channel whatever the sequence says (a
++		 * P2P-GO chanctx pins it), so advertise only the master's slots there.
++		 * Claiming its other slots made the iPhone address us where we were
++		 * not (measured 2026-11-03: synced, never connected). */
++		uint8_t ours = awdl_chan_num(awdl->channel.master, AWDL_CHAN_ENC_OPCLASS);
++		kept = awdl_chanseq_intersect(seq, master->sequence, master->sequence_enc, ours);
++		if (!kept) {
++			/* Keep what we advertised last rather than an all-empty sequence,
++			 * which reads as "never available". Logged once per episode. */
++			if (!awdl->channel.no_overlap)
++				log_info("NO OVERLAP with %s on ch %d - peer wants ch %d",
++				         ether_ntoa(&master->addr), ours,
++				         awdl_chanseq_dominant_chan(master->sequence, master->sequence_enc));
++			awdl->channel.no_overlap = 1;
++			return;
++		}
++		awdl->channel.no_overlap = 0;
++	} else {
++		memcpy(seq, master->sequence, sizeof(seq));
++	}
++	if (awdl->channel.enc != master->sequence_enc ||
++	    memcmp(awdl->channel.sequence, seq, sizeof(seq))) {
++		awdl->channel.enc = master->sequence_enc;
++		memcpy(awdl->channel.sequence, seq, sizeof(seq));
++		awdl->channel.follows_master = 1;
++		if (awdl->channel.intersect)
++			log_info("following sync master %s: %d/%d slots on our channel", ether_ntoa(&master->addr),
++			         kept, AWDL_CHANSEQ_LENGTH);
++		else
++			log_info("following channel sequence of sync master %s", ether_ntoa(&master->addr));
++	}
+ }
+ 
+ void awdl_clean_peers(struct ev_loop *loop, ev_timer *timer, int revents) {
+@@ -331,10 +523,35 @@ void awdl_clean_peers(struct ev_loop *loop, ev_timer *timer, int revents) {
+ 
+ 	/* TODO for now run election immediately after clean up; might consider seperate timer for this */
+ 	awdl_election_run(&state->awdl_state.election, &state->awdl_state.peers);
++	awdl_follow_master_chanseq(&state->awdl_state);
+ 
+ 	ev_timer_again(loop, timer);
+ }
+ 
++/* One line every few seconds while traffic flows: what a trace needs to tell
++ * "nothing sent" from "sent but not acknowledged" without a packet capture. */
++void awdl_log_traffic(struct ev_loop *loop, ev_timer *timer, int revents) {
++	(void) loop;
++	(void) revents;
++	static struct awdl_stats last;
++	struct daemon_state *state = timer->data;
++	struct awdl_stats *s = &state->awdl_state.stats;
++
++	if (s->tx_data_unicast != last.tx_data_unicast || s->rx_data != last.rx_data ||
++	    s->rx_addba != last.rx_addba) {
++		log_info("traffic: tx unicast %llu (acked %llu, lost %llu, %llu sent on presence), rx data %llu, "
++		         "mcast dropped %llu, block-ack requests %llu",
++		         (unsigned long long) (s->tx_data_unicast - last.tx_data_unicast),
++		         (unsigned long long) (s->tx_status_ok - last.tx_status_ok),
++		         (unsigned long long) (s->tx_status_fail - last.tx_status_fail),
++		         (unsigned long long) (s->tx_presence - last.tx_presence),
++		         (unsigned long long) (s->rx_data - last.rx_data),
++		         (unsigned long long) (s->tx_data_multicast_dropped - last.tx_data_multicast_dropped),
++		         (unsigned long long) (s->rx_addba - last.rx_addba));
++		last = *s;
++	}
++}
++
+ void awdl_print_stats(struct ev_loop *loop, ev_signal *handle, int revents) {
+ 	(void) loop;
+ 	(void) revents; /* should always be EV_TIMER */
+@@ -429,6 +646,11 @@ void awdl_schedule(struct ev_loop *loop, struct daemon_state *state) {
+ 	ev_timer_init(&state->ev_state.tx_mcast_timer, awdl_send_multicast, 0, 0);
+ 	ev_timer_start(loop, &state->ev_state.tx_mcast_timer);
+ 
++	/* Traffic summary line every 5 s (only when something moved) */
++	state->ev_state.traffic_timer.data = (void *) state;
++	ev_timer_init(&state->ev_state.traffic_timer, awdl_log_traffic, 5.0, 5.0);
++	ev_timer_start(loop, &state->ev_state.traffic_timer);
++
+ 	/* Register signal to print statistics */
+ 	state->ev_state.stats.data = (void *) state;
+ 	ev_signal_init(&state->ev_state.stats, awdl_print_stats, SIGSTATS);
+diff --git a/daemon/core.h b/daemon/core.h
+index 7580133..1dbd5c2 100644
+--- a/daemon/core.h
++++ b/daemon/core.h
+@@ -29,7 +29,7 @@
+ 
+ struct ev_state {
+ 	struct ev_loop *loop;
+-	ev_timer mif_timer, psf_timer, tx_timer, tx_mcast_timer, chan_timer, peer_timer;
++	ev_timer mif_timer, psf_timer, tx_timer, tx_mcast_timer, chan_timer, peer_timer, traffic_timer;
+ 	ev_io read_wlan, read_host;
+ 	ev_signal stats;
+ };
+@@ -67,7 +67,7 @@ void awdl_send_unicast(struct ev_loop *loop, ev_timer *timer, int revents);
+ void awdl_send_multicast(struct ev_loop *loop, ev_timer *timer, int revents);
+ 
+ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+-                   struct awdl_state *awdl_state, struct ieee80211_state *ieee80211_state);
++                   struct awdl_state *awdl_state, struct ieee80211_state *ieee80211_state, int qos_seq);
+ 
+ void awdl_switch_channel(struct ev_loop *loop, ev_timer *handle, int revents);
+ 
+diff --git a/daemon/io.c b/daemon/io.c
+index 03fd7a9..010c186 100644
+--- a/daemon/io.c
++++ b/daemon/io.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <errno.h>
++#include <poll.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -171,6 +172,19 @@ static int open_tun(char *dev, const struct ether_addr *self) {
+ 
+ 	// Get current flags and set them
+ 	ioctl(s, SIOCGIFFLAGS, &ifr);
++	/* No duplicate address detection: the link-local address comes from our MAC,
++	 * nobody answers DAD probes over AWDL anyway, and the address stays
++	 * "tentative" (unusable) for 1-2 s while it runs. */
++	{
++		char path[96];
++		FILE *fh;
++		snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/accept_dad", ifr.ifr_name);
++		if ((fh = fopen(path, "w"))) {
++			fputs("0\n", fh);
++			fclose(fh);
++		}
++	}
++
+ 	ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+ 	if ((err = ioctl(s, SIOCSIFFLAGS, &ifr)) < 0) {
+ 		log_error("tun: unable to set up");
+@@ -363,6 +377,17 @@ int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {
+ 	if (!state || !state->wlan_handle)
+ 		return -EINVAL;
+ 	err = pcap_inject(state->wlan_handle, buf, len);
++	/* The socket's send buffer is full: the driver is behind (fast sender, or
++	 * the peer is away and frames are being retried). Dropping here cost ~100
++	 * TCP segments at the start of a send and seconds of recovery (2026-11-12),
++	 * so wait for room, at most 40 ms in all. */
++	for (int tries = 0; err < 0 && errno == EAGAIN && tries < 20; tries++) {
++		struct pollfd pfd = {.fd = pcap_get_selectable_fd(state->wlan_handle), .events = POLLOUT};
++		if (pfd.fd < 0)
++			break;
++		poll(&pfd, 1, 2);
++		err = pcap_inject(state->wlan_handle, buf, len);
++	}
+ 	if (err < 0) {
+ 		log_error("unable to inject packet (%s)", pcap_geterr(state->wlan_handle));
+ 		return err;
+diff --git a/daemon/io.h b/daemon/io.h
+index 1deb21a..d6d69ac 100644
+--- a/daemon/io.h
++++ b/daemon/io.h
+@@ -43,6 +43,9 @@ struct io_state {
+ 	char *dumpfile;
+ 	char wlan_no_monitor_mode;
+ 	int wlan_is_file;
++	int sta_ifindex;      /* -G: access-point interface that holds peers as stations (0 = off) */
++	int sta_count;        /* stations registered right now */
++	int sta_last_aid;     /* last association ID handed out (each station gets its own) */
+ };
+ 
+ int io_state_init(struct io_state *state, const char *wlan, const char *host, const struct ether_addr *bssid_filter);
+diff --git a/daemon/netutils.c b/daemon/netutils.c
+index 5ce37d3..f182a64 100644
+--- a/daemon/netutils.c
++++ b/daemon/netutils.c
+@@ -199,6 +199,92 @@ out:
+ 	return err;
+ }
+ 
++static int nl80211_ack_error(struct sockaddr_nl *nla __attribute__((unused)), struct nlmsgerr *err, void *arg) {
++	*(int *) arg = err->error;
++	return NL_STOP;
++}
++
++static int nl80211_ack_done(struct nl_msg *msg __attribute__((unused)), void *arg) {
++	*(int *) arg = 0;
++	return NL_STOP;
++}
++
++/* Send a request and return the kernel's answer to it (0 or -errno). */
++static int nl80211_request(struct nl_msg *m) {
++	int result = 1;
++	struct nl_cb *cb = nl_cb_alloc(NL_CB_DEFAULT);
++	int err;
++
++	if (!cb)
++		return -ENOMEM;
++	nl_cb_err(cb, NL_CB_CUSTOM, nl80211_ack_error, &result);
++	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, nl80211_ack_done, &result);
++	err = nl_send_auto(nl80211_state.socket, m);
++	while (err >= 0 && result > 0)
++		err = nl_recvmsgs(nl80211_state.socket, cb);
++	nl_cb_put(cb);
++	if (result <= 0) /* the kernel answered: 0 or its -errno */
++		return result;
++	return -EIO;
++}
++
++int station_add(int ifindex, const struct ether_addr *addr, uint16_t aid, uint16_t ht_cap, uint8_t ht_ampdu,
++                const uint8_t ht_mcs[4], const uint8_t *vht_cap) {
++	/* 6 to 54 Mbit/s in 500 kbit/s units: the 5 GHz OFDM rates every HT device has */
++	static const uint8_t rates[] = {12, 18, 24, 36, 48, 72, 96, 108};
++	struct nl80211_sta_flag_update flags = {
++		.mask = (1 << NL80211_STA_FLAG_AUTHORIZED) | (1 << NL80211_STA_FLAG_WME),
++		.set = (1 << NL80211_STA_FLAG_AUTHORIZED) | (1 << NL80211_STA_FLAG_WME),
++	};
++	uint8_t ht[26] = {0}; /* struct ieee80211_ht_cap: info, A-MPDU parameters, MCS set (16), rest zero */
++	struct nl_msg *m = nlmsg_alloc();
++	int err;
++
++	if (!m)
++		return -ENOMEM;
++	ht[0] = ht_cap & 0xff;
++	ht[1] = ht_cap >> 8;
++	ht[2] = ht_ampdu;
++	memcpy(ht + 3, ht_mcs, 4);
++
++	genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_NEW_STATION, 0);
++	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
++	NLA_PUT(m, NL80211_ATTR_MAC, ETH_ALEN, addr);
++	NLA_PUT(m, NL80211_ATTR_STA_SUPPORTED_RATES, sizeof(rates), rates);
++	NLA_PUT_U16(m, NL80211_ATTR_STA_AID, aid);
++	NLA_PUT_U16(m, NL80211_ATTR_STA_LISTEN_INTERVAL, 1);
++	NLA_PUT(m, NL80211_ATTR_STA_FLAGS2, sizeof(flags), &flags);
++	NLA_PUT(m, NL80211_ATTR_HT_CAPABILITY, sizeof(ht), ht);
++	if (vht_cap)
++		NLA_PUT(m, NL80211_ATTR_VHT_CAPABILITY, 12, vht_cap);
++
++	err = nl80211_request(m);
++	nlmsg_free(m);
++	return err;
++
++nla_put_failure:
++	nlmsg_free(m);
++	return -ENOBUFS;
++}
++
++int station_del(int ifindex, const struct ether_addr *addr) {
++	struct nl_msg *m = nlmsg_alloc();
++	int err;
++
++	if (!m)
++		return -ENOMEM;
++	genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_DEL_STATION, 0);
++	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
++	NLA_PUT(m, NL80211_ATTR_MAC, ETH_ALEN, addr);
++	err = nl80211_request(m);
++	nlmsg_free(m);
++	return err;
++
++nla_put_failure:
++	nlmsg_free(m);
++	return -ENOBUFS;
++}
++
+ int set_monitor_mode(int ifindex) {
+ 	int err = 0;
+ 	struct nl_msg *m = NULL;
+@@ -590,6 +676,17 @@ int neighbor_remove(int ifindex, const struct in6_addr *in6) {
+ 	return 0;
+ }
+ 
++int station_add(int ifindex, const struct ether_addr *addr, uint16_t aid, uint16_t ht_cap, uint8_t ht_ampdu,
++                const uint8_t ht_mcs[4], const uint8_t *vht_cap) {
++	(void) ifindex; (void) addr; (void) aid; (void) ht_cap; (void) ht_ampdu; (void) ht_mcs; (void) vht_cap;
++	return -ENOTSUP;
++}
++
++int station_del(int ifindex, const struct ether_addr *addr) {
++	(void) ifindex; (void) addr;
++	return -ENOTSUP;
++}
++
+ #endif /* __APPLE__ */
+ 
+ int neighbor_add_rfc4291(int ifindex, const struct ether_addr *addr) {
+diff --git a/daemon/netutils.h b/daemon/netutils.h
+index b800c87..32520af 100644
+--- a/daemon/netutils.h
++++ b/daemon/netutils.h
+@@ -60,6 +60,14 @@ int neighbor_add(int ifindex, const struct ether_addr *, const struct in6_addr *
+ 
+ int neighbor_remove(int ifindex, const struct in6_addr *);
+ 
++/* Register a peer as an associated, authorized QoS station of an access-point interface
++ * (as hostapd does after an association), with the capabilities it advertises. vht_cap may
++ * be NULL. Returns 0 or a negative netlink error. */
++int station_add(int ifindex, const struct ether_addr *addr, uint16_t aid, uint16_t ht_cap, uint8_t ht_ampdu,
++                const uint8_t ht_mcs[4], const uint8_t *vht_cap);
++
++int station_del(int ifindex, const struct ether_addr *addr);
++
+ int neighbor_add_rfc4291(int ifindex, const struct ether_addr *);
+ 
+ int neighbor_remove_rfc4291(int ifindex, const struct ether_addr *);
+diff --git a/daemon/owl.c b/daemon/owl.c
+index 6136d39..4d9d657 100644
+--- a/daemon/owl.c
++++ b/daemon/owl.c
+@@ -20,6 +20,8 @@
+ #include <stdint.h>
+ #include <unistd.h>
+ #include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
+ #include <signal.h>
+ #include <syslog.h>
+ #include <errno.h>
+@@ -91,15 +93,28 @@ int main(int argc, char *argv[]) {
+ 	int log_level = LOG_INFO;
+ 	int filter_rssi = 1;
+ 	int no_monitor_mode = 0;
++	int no_follow = 0;
++	int intersect = 0;
++	int dps_single_band = 0;
++	int dps_infra_channel = 0;
++	int ht40 = 0;
++	int vht80 = 0;
++	int realtime = 0;
++	int accept_addba = 0;
++	int probe_addba = 0;
++	long presence_ms = 0;
++	int tx_rate = 0, tx_mcs = -1, tx_mcs_flags = 0, tx_auto = 0;
++	long peer_timeout_ms = 0;
+ 
+ 	char wlan[PATH_MAX] = "";
+ 	char host[IFNAMSIZ] = DEFAULT_AWDL_DEVICE;
++	char sta_iface[IFNAMSIZ] = "";
+ 
+ 	struct ev_loop *loop;
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fN")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNFIP:M:SC:HVRr:Ap:G:B")) != -1) {
+ 		switch (c) {
+ 			case 'D':
+ 				daemon = 1;
+@@ -126,6 +141,122 @@ int main(int argc, char *argv[]) {
+ 			case 'N':
+ 				no_monitor_mode = 1;
+ 				break;
++			case 'F':
++				no_follow = 1;
++				break;
++			case 'I':
++				/* Radio pinned to -c (P2P-GO chanctx): advertise only the sync
++				 * master's slots on that channel. */
++				intersect = 1;
++				break;
++			case 'P':
++				/* Peer timeout in ms (default 2000). iPhones leave our channel
++				 * for 10-14 s at a time; dropping them after 2 s also drops the
++				 * neighbor entry TCP to them depends on. */
++				peer_timeout_ms = atol(optarg);
++				if (peer_timeout_ms < 500 || peer_timeout_ms > 60000) {
++					fprintf(stderr, "-P wants 500..60000 (ms)\n");
++					return EXIT_FAILURE;
++				}
++				break;
++			case 'C': {
++				/* DPS infra channel, as iOS advertises its own (E2.9) */
++				long c = atol(optarg);
++				if (c < 1 || c > 196) {
++					fprintf(stderr, "-C wants a channel number 1..196\n");
++					return EXIT_FAILURE;
++				}
++				dps_infra_channel = (int) c;
++				break;
++			}
++			case 'p':
++				/* Send unicast to a peer heard within the last N ms, even
++				 * outside the slots the schedule computes */
++				presence_ms = atol(optarg);
++				if (presence_ms < 1 || presence_ms > 100) {
++					fprintf(stderr, "-p wants 1..100 (ms)\n");
++					return EXIT_FAILURE;
++				}
++				break;
++			case 'A':
++				/* Answer a peer's Block Ack (ADDBA) request, so it aggregates */
++				accept_addba = 1;
++				break;
++			case 'r': {
++				/* Unicast data rate: Mbit/s (6 9 12 18 24 36 48 54) or an HT
++				 * MCS as mcsN, mcsN-40, mcsN-sgi, mcsN-40-sgi (N = 0..15). */
++				static const int legacy[] = {6, 9, 12, 18, 24, 36, 48, 54};
++				int ok = 0;
++				if (!strcmp(optarg, "auto") || !strcmp(optarg, "auto-ht")) {
++					tx_auto = optarg[4] ? 2 : 1;
++					ok = 1;
++				} else if (!strncmp(optarg, "mcs", 3)) {
++					char *end;
++					long m = strtol(optarg + 3, &end, 10);
++					ok = end != optarg + 3 && m >= 0 && m <= 15;
++					tx_mcs = (int) m;
++					while (ok && *end) {
++						if (!strncmp(end, "-40", 3)) {
++							tx_mcs_flags |= 0x01;
++							end += 3;
++						} else if (!strncmp(end, "-sgi", 4)) {
++							tx_mcs_flags |= 0x04;
++							end += 4;
++						} else {
++							ok = 0;
++						}
++					}
++				} else {
++					for (unsigned i = 0; i < sizeof(legacy) / sizeof(legacy[0]); i++)
++						if (atoi(optarg) == legacy[i] && strlen(optarg) <= 2)
++							ok = 1;
++					tx_rate = 2 * atoi(optarg);
++				}
++				if (!ok) {
++					fprintf(stderr, "-r wants 6|9|12|18|24|36|48|54 (Mbit/s) or mcs0..mcs15[-40][-sgi], "
++					                "or auto / auto-ht (fastest rate the peer acknowledges)\n");
++					return EXIT_FAILURE;
++				}
++				break;
++			}
++			case 'R':
++				/* DPS real-time bit (duty-cycle experiment) */
++				realtime = 1;
++				break;
++			case 'H':
++				/* HT40 capable (radio chanctx must be 40 MHz) */
++				ht40 = 1;
++				break;
++			case 'V':
++				/* VHT 80 MHz capable (radio chanctx must be 80 MHz) */
++				vht80 = 1;
++				break;
++			case 'S':
++				/* DPS without "dual band" (radio held on 2.4 GHz ch 6), E2.8 */
++				dps_single_band = 1;
++				break;
++			case 'M': {
++				/* Our election self metric (default 60; iOS 27.2 uses 65).
++				 * Higher wins the master election (experiment E2.6). */
++				long m = atol(optarg);
++				if (m < 1 || m > 1000) {
++					fprintf(stderr, "-M wants 1..1000\n");
++					return EXIT_FAILURE;
++				}
++				awdl_election_metric_init = (uint32_t) m;
++				break;
++			}
++			case 'B':
++				/* Ask the peer for a Block Ack session and log its answer (probe only) */
++				probe_addba = 1;
++				break;
++			case 'G':
++				/* E-TXAGG: register peers we send to as stations of this access-point
++				 * interface (it must carry our address), so the firmware does rate
++				 * control and A-MPDU aggregation for them. Needs a driver that lets
++				 * mac80211 run Block Ack with AWDL peers (mt7921e awdl_ba=1). */
++				snprintf(sta_iface, sizeof(sta_iface), "%s", optarg);
++				break;
+ 			case '?':
+ 				if (optopt == 'i')
+ 					fprintf(stderr, "Option -%c needs to specify a wireless interface.\n", optopt);
+@@ -170,6 +301,9 @@ int main(int argc, char *argv[]) {
+ 		case 6:
+ 			chan = CHAN_OPCLASS_6;
+ 			break;
++		case 36:
++			chan = CHAN_OPCLASS_36;
++			break;
+ 		case 44:
+ 			chan = CHAN_OPCLASS_44;
+ 			break;
+@@ -177,7 +311,7 @@ int main(int argc, char *argv[]) {
+ 			chan = CHAN_OPCLASS_149;
+ 			break;
+ 		default:
+-			log_error("Unsupported channel %d (use 6, 44, or 149)", chan_num);
++			log_error("Unsupported channel %d (use 6, 36, 44, or 149)", chan_num);
+ 			return EXIT_FAILURE;
+ 	}
+ 
+@@ -193,6 +327,58 @@ int main(int argc, char *argv[]) {
+ 		return EXIT_FAILURE;
+ 	}
+ 	state.awdl_state.filter_rssi = filter_rssi;
++	state.awdl_state.channel.follow_disabled = no_follow;
++	state.awdl_state.channel.intersect = intersect;
++	state.awdl_state.dps_single_band = dps_single_band;
++	state.awdl_state.dps_infra_channel = (uint8_t) dps_infra_channel;
++	state.awdl_state.ht40 = (uint8_t) ht40;
++	state.awdl_state.vht80 = (uint8_t) vht80;
++	state.awdl_state.realtime = (uint8_t) realtime;
++	state.awdl_state.accept_addba = (uint8_t) accept_addba;
++	if (accept_addba)
++		log_info("Block Ack: accepting requests");
++	state.awdl_state.probe_addba = (uint8_t) probe_addba;
++	if (probe_addba)
++		log_info("Block Ack probe: asking peers we send to");
++	state.awdl_state.presence_us = (uint32_t) presence_ms * 1000;
++	if (presence_ms)
++		log_info("presence window: %ld ms", presence_ms);
++	if (tx_auto) {
++		char rate[48];
++		awdl_rate_auto_init(&state.awdl_state, tx_auto);
++		log_info("unicast data rate: automatic, starting at %s",
++		         awdl_rate_str(&state.awdl_state, rate, sizeof(rate)));
++	} else if (tx_mcs >= 0) {
++		state.awdl_state.tx_mcs = (int8_t) tx_mcs;
++		state.awdl_state.tx_mcs_flags = (uint8_t) tx_mcs_flags;
++		log_info("unicast data rate: HT MCS %d%s%s", tx_mcs, tx_mcs_flags & 0x01 ? ", 40 MHz" : "",
++		         tx_mcs_flags & 0x04 ? ", short GI" : "");
++	} else if (tx_rate) {
++		state.awdl_state.tx_rate = (uint8_t) tx_rate;
++		log_info("unicast data rate: %d Mbit/s", tx_rate / 2);
++	}
++	if (realtime)
++		log_info("DPS: real-time bit set");
++	if (ht40)
++		log_info("HT caps: 40 MHz");
++	if (vht80)
++		log_info("VHT caps: 80 MHz (TLV 0x11)");
++	if (dps_single_band)
++		log_info("DPS: single band (no dual-band flag)");
++	if (dps_infra_channel)
++		log_info("DPS: infra channel %d (BSSID zeroed)", dps_infra_channel);
++	state.io.sta_ifindex = 0;
++	state.io.sta_count = 0;
++	state.io.sta_last_aid = 0;
++	if (*sta_iface) {
++		state.io.sta_ifindex = (int) if_nametoindex(sta_iface);
++		if (state.io.sta_ifindex)
++			log_info("stations: peers we send to are registered on %s", sta_iface);
++		else
++			log_warn("stations: no interface %s, sending single frames", sta_iface);
++	}
++	if (peer_timeout_ms)
++		state.awdl_state.peers.timeout = (uint64_t) peer_timeout_ms * 1000; /* us */
+ 
+ 	if (state.io.wlan_ifindex)
+ 		log_info("WLAN device: %s (addr %s)", state.io.wlan_ifname, ether_ntoa(&state.io.if_ether_addr));
+diff --git a/src/channel.c b/src/channel.c
+index e2c57ad..c641018 100644
+--- a/src/channel.c
++++ b/src/channel.c
+@@ -53,6 +53,34 @@ void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *cha
+ 	}
+ }
+ 
++int awdl_chanseq_intersect(struct awdl_chan *dst, const struct awdl_chan *src,
++                           enum awdl_chan_encoding enc, uint8_t keep) {
++	/* For a radio that cannot hop (a P2P-GO channel context pins it), the
++	 * honest sequence: the peer's slots we really are on, empty elsewhere.
++	 * Empty slots are ordinary in every captured Apple sequence. */
++	int kept = 0;
++	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++) {
++		if (keep && awdl_chan_num(src[i], enc) == keep) {
++			dst[i] = src[i];
++			kept++;
++		} else {
++			dst[i] = CHAN_NULL;
++		}
++	}
++	return kept;
++}
++
++uint8_t awdl_chanseq_dominant_chan(const struct awdl_chan *seq, enum awdl_chan_encoding enc) {
++	int count[256] = {0};
++	uint8_t best = 0;
++	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++) {
++		uint8_t c = awdl_chan_num(seq[i], enc);
++		if (c && ++count[c] > count[best])
++			best = c;
++	}
++	return best;
++}
++
+ uint8_t awdl_chan_num(struct awdl_chan chan, enum awdl_chan_encoding enc) {
+ 	switch (enc) {
+ 		case AWDL_CHAN_ENC_SIMPLE:
+diff --git a/src/channel.h b/src/channel.h
+index 10e60a8..fa72069 100644
+--- a/src/channel.h
++++ b/src/channel.h
+@@ -49,6 +49,7 @@ struct awdl_chan {
+ 
+ #define CHAN_NULL (struct awdl_chan) { { { 0, 0x00 } } }
+ #define CHAN_OPCLASS_6 (struct awdl_chan) { { { 6, 0x51 } } }
++#define CHAN_OPCLASS_36 (struct awdl_chan) { { { 36, 0x80 } } }
+ #define CHAN_OPCLASS_44 (struct awdl_chan) { { { 44, 0x80 } } }
+ #define CHAN_OPCLASS_149 (struct awdl_chan) { { { 149, 0x80 } } }
+ 
+@@ -61,6 +62,15 @@ struct awdl_channel_state {
+ 	struct awdl_chan sequence[AWDL_CHANSEQ_LENGTH];
+ 	struct awdl_chan master;
+ 	struct awdl_chan current;
++	/* 1 while 'sequence' is copied from the elected sync master (iOS rejects a
++	 * constant single-channel sequence); 0 while it is our static one. */
++	uint8_t follows_master;
++	uint8_t follow_disabled; /* -F: keep our static sequence */
++	/* -I: the radio is pinned to 'master' (a P2P-GO channel context, or a
++	 * managed interface): advertise only the sync master's slots on that
++	 * channel and leave the rest empty, instead of claiming slots we miss. */
++	uint8_t intersect;
++	uint8_t no_overlap; /* 1 while the master has no slot on our channel (logged once) */
+ };
+ 
+ void awdl_chanseq_init(struct awdl_chan *seq);
+@@ -69,4 +79,13 @@ void awdl_chanseq_init_idle(struct awdl_chan *seq);
+ 
+ void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *chan);
+ 
++/* dst = src with every slot blanked whose channel is not 'keep' (bytes copied
++ * from src, never constructed). Returns the number of slots kept. dst and src
++ * must not overlap. Ported from jedbillyb/owl (GPLv3) for the P2P-GO case. */
++int awdl_chanseq_intersect(struct awdl_chan *dst, const struct awdl_chan *src,
++                           enum awdl_chan_encoding enc, uint8_t keep);
++
++/* The channel named in most of the 16 slots (0 if none). */
++uint8_t awdl_chanseq_dominant_chan(const struct awdl_chan *seq, enum awdl_chan_encoding enc);
++
+ #endif /* AWDL_CHANNEL_H_ */
+diff --git a/src/election.c b/src/election.c
+index fda2e9d..ac1d972 100644
+--- a/src/election.c
++++ b/src/election.c
+@@ -24,6 +24,8 @@
+ #include "peers.h"
+ #include "log.h"
+ 
++uint32_t awdl_election_metric_init = AWDL_ELECTION_METRIC_INIT;
++
+ static inline int compare(uint32_t a, uint32_t b) {
+ 	return (a < b) ? -1 : (a > b);
+ }
+@@ -38,7 +40,7 @@ int awdl_election_is_sync_master(const struct awdl_election_state *state, const
+ 
+ static void awdl_election_reset_metric(struct awdl_election_state *state) {
+ 	state->self_counter = AWDL_ELECTION_COUNTER_INIT;
+-	state->self_metric = AWDL_ELECTION_METRIC_INIT;
++	state->self_metric = awdl_election_metric_init;
+ }
+ 
+ static void awdl_election_reset_self(struct awdl_election_state *state) {
+diff --git a/src/election.h b/src/election.h
+index 31a8b71..bbc4d83 100644
+--- a/src/election.h
++++ b/src/election.h
+@@ -24,6 +24,9 @@
+ 
+ #define AWDL_ELECTION_TREE_MAX_HEIGHT 10 /* arbitrary limit */
+ #define AWDL_ELECTION_METRIC_INIT 60
++
++/* Self metric used on (re)init; the daemon's -M sets it (experiment E2.6). */
++extern uint32_t awdl_election_metric_init;
+ #define AWDL_ELECTION_COUNTER_INIT 0
+ 
+ struct awdl_peer_state;
+diff --git a/src/peers.c b/src/peers.c
+index a56d0c4..64d5986 100644
+--- a/src/peers.c
++++ b/src/peers.c
+@@ -67,8 +67,11 @@ struct awdl_peer *awdl_peer_new(const struct ether_addr *addr) {
+ 	struct awdl_peer *peer = (struct awdl_peer *) malloc(sizeof(struct awdl_peer));
+ 	*(struct ether_addr *) &peer->addr = *addr;
+ 	peer->last_update = 0;
++	peer->last_heard = 0;
+ 	awdl_election_state_init(&peer->election, addr);
+ 	awdl_chanseq_init_static(peer->sequence, &CHAN_NULL);
++	peer->sequence_enc = AWDL_CHAN_ENC_OPCLASS;
++	peer->has_sequence = 0;
+ 	peer->sync_offset = 0;
+ 	peer->devclass = 0;
+ 	peer->version = 0;
+@@ -77,6 +80,19 @@ struct awdl_peer *awdl_peer_new(const struct ether_addr *addr) {
+ 	strcpy(peer->name, "");
+ 	strcpy(peer->country_code, "NA");
+ 	peer->is_valid = 0;
++	peer->has_ht = 0;
++	peer->has_vht = 0;
++	peer->is_sta = 0;
++	peer->sta_failed = 0;
++	peer->ba_granted = 0;
++	peer->ba_tries = 0;
++	peer->ba_last = 0;
++	peer->ba_wait_until = 0;
++	peer->qos_seq = 0;
++	peer->ht_cap = 0;
++	peer->ht_ampdu = 0;
++	memset(peer->ht_mcs, 0, sizeof(peer->ht_mcs));
++	memset(peer->vht_cap, 0, sizeof(peer->vht_cap));
+ 	return peer;
+ }
+ 
+diff --git a/src/peers.h b/src/peers.h
+index eaa9945..ea77983 100644
+--- a/src/peers.h
++++ b/src/peers.h
+@@ -38,8 +38,11 @@ enum peers_status {
+ struct awdl_peer {
+ 	const struct ether_addr addr;
+ 	uint64_t last_update;
++	uint64_t last_heard; /* any frame from this peer (data too): it is on our channel right then */
+ 	struct awdl_election_state election;
+ 	struct awdl_chan sequence[AWDL_CHANSEQ_LENGTH];
++	enum awdl_chan_encoding sequence_enc; /* encoding 'sequence' arrived in */
++	uint8_t has_sequence; /* a channel sequence TLV has been received */
+ 	uint64_t sync_offset;
+ 	char name[HOST_NAME_LENGTH_MAX + 1]; /* space for trailing zero */
+ 	char country_code[2 + 1];
+@@ -49,6 +52,24 @@ struct awdl_peer {
+ 	uint8_t supports_v2 : 1;
+ 	uint8_t sent_mif : 1;
+ 	uint8_t is_valid : 1;
++	/* -G (E-TXAGG): the peer's rate capabilities as it advertises them (TLV 0x07, and the VHT
++	 * Capabilities element in TLV 0x11), and whether it is registered as a station of our
++	 * access-point interface (the firmware then picks rates and aggregates frames to it). */
++	uint8_t has_ht : 1;
++	uint8_t has_vht : 1;
++	uint8_t is_sta : 1;
++	uint8_t sta_failed : 1;
++	/* Our Block Ack session towards a station peer: asked for by OWL, in AWDL's frame format.
++	 * qos_seq numbers the QoS Data frames to it (12 bits; the request names the next one). */
++	uint8_t ba_granted : 1;
++	uint8_t ba_tries;
++	uint64_t ba_last;       /* when the last request went out */
++	uint64_t ba_wait_until; /* hold data until then, or until the answer */
++	uint16_t qos_seq;
++	uint16_t ht_cap;
++	uint8_t ht_ampdu;
++	uint8_t ht_mcs[4];
++	uint8_t vht_cap[12];
+ };
+ 
+ typedef void (*awdl_peer_cb)(struct awdl_peer *, void *arg);
+diff --git a/src/rx.c b/src/rx.c
+index 9c0d68e..13f8422 100644
+--- a/src/rx.c
++++ b/src/rx.c
+@@ -102,6 +102,8 @@ int awdl_handle_chanseq_tlv(struct awdl_peer *src, const struct buf *val,
+ 		          awdl_chan_num(list[14], encoding), awdl_chan_num(list[15], encoding));
+ 		memcpy(src->sequence, list, sizeof(list));
+ 	}
++	src->sequence_enc = encoding;
++	src->has_sequence = 1;
+ 	return RX_OK;
+ 
+ wire_error:
+@@ -205,9 +207,46 @@ wire_error:
+ 	return RX_TOO_SHORT;
+ }
+ 
++/* TLV 0x07 value: 2 unknown bytes, HT capability info (LE), A-MPDU parameters, then the
++ * RX MCS bitmap, one byte per stream (iPhone 17: `00 00 6f 88 1b ff ff 00 ...`). Only used
++ * for -G; a shorter TLV is skipped, never an error (that would drop the whole frame). */
++int awdl_handle_ht_capabilities_tlv(struct awdl_peer *src, const struct buf *val,
++                                    struct awdl_state *state __attribute__((unused))) {
++	const uint8_t *b = buf_data(val);
++	int len = buf_len(val);
++
++	if (len < 6)
++		return RX_IGNORE;
++	src->ht_cap = (uint16_t) (b[2] | (b[3] << 8));
++	src->ht_ampdu = b[4];
++	memset(src->ht_mcs, 0, sizeof(src->ht_mcs));
++	for (int i = 0; i < (int) sizeof(src->ht_mcs) && 5 + i < len; i++)
++		src->ht_mcs[i] = b[5 + i];
++	src->has_ht = 1;
++	return RX_OK;
++}
++
++/* TLV 0x11 holds plain 802.11 elements; the VHT Capabilities element is ID 191, 12 bytes. */
++int awdl_handle_ieee80211_container_tlv(struct awdl_peer *src, const struct buf *val,
++                                        struct awdl_state *state __attribute__((unused))) {
++	const uint8_t *b = buf_data(val);
++	int len = buf_len(val);
++	for (int off = 0; off + 2 <= len && off + 2 + b[off + 1] <= len; off += 2 + b[off + 1]) {
++		if (b[off] == 191 && b[off + 1] == sizeof(src->vht_cap)) {
++			memcpy(src->vht_cap, b + off + 2, sizeof(src->vht_cap));
++			src->has_vht = 1;
++		}
++	}
++	return RX_OK;
++}
++
+ int awdl_handle_tlv(struct awdl_peer *src, uint8_t type, const struct buf *val,
+                     struct awdl_state *state, uint64_t tsft) {
+ 	switch (type) {
++		case AWDL_ENHANCED_DATA_RATE_CAPABILITIES_TLV:
++			return awdl_handle_ht_capabilities_tlv(src, val, state);
++		case AWDL_IEEE80211_CNTNR_TLV:
++			return awdl_handle_ieee80211_container_tlv(src, val, state);
+ 		case AWDL_SYNCHRONIZATON_PARAMETERS_TLV:
+ 			return awdl_handle_sync_params_tlv(src, val, state, tsft);
+ 		case AWDL_CHAN_SEQ_TLV:
+@@ -306,8 +345,21 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
+ 	}
+ 
+ 	if (buf_len(frame) > 0) {
+-		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
+-		return RX_UNEXPECTED_FORMAT;
++		/* Some iPhones (seen: AWDL 9.3, iOS 27) pad every action frame with zero bytes to a
++		 * multiple of 4. The zeros read as empty type-0 TLVs above, and the last 1-2 bytes
++		 * are too short for a TLV header. That is padding, not a malformed frame. Rejecting
++		 * it skipped sent_mif below, so such an iPhone never became a peer: no neighbor
++		 * entry, and our TCP replies to it waited on neighbor discovery (2026-11-12: its
++		 * SYNs went unanswered for 33 s, and it never listed us). */
++		const uint8_t *rest = buf_data(frame);
++		int i, n = buf_len(frame);
++		for (i = 0; i < n && rest[i] == 0; i++)
++			;
++		if (i < n) {
++			log_debug("awdl_action: unexpected bytes (%d) at end of frame", n);
++			return RX_UNEXPECTED_FORMAT;
++		}
++		log_trace("awdl_action: %d bytes of zero padding at end of frame", n);
+ 	}
+ 
+ 	if (subtype == AWDL_ACTION_MIF)
+@@ -417,7 +469,8 @@ wire_error:
+ 	return RX_TOO_SHORT;
+ }
+ 
+-static int radiotap_parse(const struct buf *frame, signed char *rssi, uint8_t *flags, uint64_t *tsft) {
++static int radiotap_parse(const struct buf *frame, signed char *rssi, uint8_t *flags, uint64_t *tsft,
++                          int *tx_flags) {
+ 	struct ieee80211_radiotap_iterator iter;
+ 	int err;
+ 
+@@ -440,6 +493,11 @@ static int radiotap_parse(const struct buf *frame, signed char *rssi, uint8_t *f
+ 				case IEEE80211_RADIOTAP_DBM_ANTSIGNAL: /* https://www.radiotap.org/fields/Antenna%20signal.html */
+ 					if (rssi)
+ 						*rssi = *(signed char *) iter.this_arg;
++					break;
++				case IEEE80211_RADIOTAP_TX_FLAGS: /* only on the TX-status copy of a frame we sent */
++					if (tx_flags)
++						*tx_flags = le16toh(*(uint16_t *) iter.this_arg);
++					break;
+ 				default:
+ 					/* ignore */
+ 					break;
+@@ -469,10 +527,12 @@ int awdl_rx(const struct buf *frame, struct buf ***data_frame, struct awdl_state
+ 	uint16_t fc, qosc; /* frame and QoS control */
+ 	signed char rssi;
+ 	uint64_t tsft;
+-	uint8_t flags;
++	uint8_t flags = 0;
++	int tx_flags = -1;
+ 
++	rssi = 0;
+ 	tsft = clock_time_us(); /* TODO Radiotap TSFT is more accurate but then need to access TSF in clock_time_us() */
+-	if (radiotap_parse(frame, &rssi, &flags, NULL /* &tsft */) < 0)
++	if (radiotap_parse(frame, &rssi, &flags, NULL /* &tsft */, &tx_flags) < 0)
+ 		return RX_UNEXPECTED_FORMAT;
+ 	BUF_STRIP(frame, le16toh(((const struct ieee80211_radiotap_header *) buf_data(frame))->it_len));
+ 
+@@ -486,17 +546,86 @@ int awdl_rx(const struct buf *frame, struct buf ***data_frame, struct awdl_state
+ 	to = &ieee80211->addr1;
+ 	fc = le16toh(ieee80211->frame_control);
+ 
+-	if (!memcmp(from, &state->self_address, sizeof(struct ether_addr)))
++	if (!memcmp(from, &state->self_address, sizeof(struct ether_addr))) {
++		/* mac80211 returns every injected frame with its TX status: count
++		 * whether the peer acknowledged our unicast data (0x0001 = failed). */
++		if (tx_flags >= 0 && (fc & IEEE80211_FCTL_FTYPE) == IEEE80211_FTYPE_DATA &&
++		    !(to->ether_addr_octet[0] & 0x01)) {
++			int changed;
++			if (tx_flags & 0x0001)
++				state->stats.tx_status_fail++;
++			else
++				state->stats.tx_status_ok++;
++			changed = awdl_rate_auto_feedback(state, tx_flags & 0x0001, tsft);
++			if (changed) {
++				char rate[48];
++				log_info("unicast data rate now %s (%d of the last 100 frames were not acknowledged)",
++				         awdl_rate_str(state, rate, sizeof(rate)), changed - 1);
++			}
++		}
+ 		return RX_IGNORE_FROM_SELF; /* TODO ignore frames from self, should be filtered at pcap level */
++	}
+ 
+ 	//if (!(to->ether_addr_octet[0] & 0x01) && memcmp(to, &state->self_address, sizeof(struct ether_addr)))
+ 	//	return RX_IGNORE_NOPROMISC; /* neither broadcast/multicast nor unicast to me */
+ 
+ 	BUF_STRIP(frame, sizeof(struct ieee80211_hdr));
+ 
++	if (state->presence_us) {
++		struct awdl_peer *heard;
++		if (awdl_peer_get(state->peers.peers, from, &heard) == PEERS_OK)
++			heard->last_heard = tsft;
++	}
++
+ 	/* Processing based on frame type and subtype */
+ 	switch (fc & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) {
+ 		case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ACTION:
++			/* Block Ack category, ADDBA request, addressed to us by a peer:
++			 * note it for the daemon to answer (-A). */
++			if (buf_len(frame) >= 6 && buf_data(frame)[0] == 3 && buf_data(frame)[1] != 0) {
++				/* ADDBA response or DELBA: only of interest as the answer to our probe (-B) */
++				const uint8_t *b = buf_data(frame);
++				if (!memcmp(to, &state->self_address, sizeof(struct ether_addr))) {
++					struct awdl_peer *answerer = NULL;
++					awdl_peer_get(state->peers.peers, from, &answerer);
++					if (answerer && answerer->is_sta) {
++						/* -G: the answer to our request, or the end of our session. The
++						 * driver sees the same frame and switches aggregation on or off. */
++						if (b[1] == 1 && buf_len(frame) >= 9) {
++							answerer->ba_wait_until = 0;
++							answerer->ba_granted = (b[3] | (b[4] << 8)) == 0;
++							if (answerer->ba_granted)
++								log_info("Block Ack: %s agreed; its frames are aggregated from here on",
++								         ether_ntoa(from));
++						} else if (b[1] == 2 && !((b[2] | (b[3] << 8)) & 0x0800)) {
++							answerer->ba_granted = 0;
++						}
++					}
++					if (b[1] == 1 && buf_len(frame) >= 9)
++						log_info("Block Ack probe: %s answered request %d: status %d, tid %d, window %d, A-MSDU %d",
++						         ether_ntoa(from), b[2], b[3] | (b[4] << 8), (b[5] >> 2) & 0xf,
++						         ((b[5] | (b[6] << 8)) >> 6) & 0x3ff, b[5] & 1);
++					else if (b[1] == 2)
++						log_info("Block Ack: %s ended a session (DELBA, parameters 0x%04x, reason %d)",
++						         ether_ntoa(from), b[2] | (b[3] << 8), b[4] | (b[5] << 8));
++				}
++				return RX_IGNORE;
++			}
++			if (buf_len(frame) >= 9 && buf_data(frame)[0] == 3 && buf_data(frame)[1] == 0) {
++				if (!memcmp(to, &state->self_address, sizeof(struct ether_addr)) &&
++				    awdl_peer_get(state->peers.peers, from, NULL) == PEERS_OK) {
++					const uint8_t *b = buf_data(frame);
++					state->stats.rx_addba++;
++					if (state->accept_addba) {
++						state->addba.peer = *from;
++						state->addba.token = b[2];
++						state->addba.params = (uint16_t) (b[3] | (b[4] << 8));
++						state->addba.timeout = (uint16_t) (b[5] | (b[6] << 8));
++						state->addba.pending = 1;
++					}
++				}
++				return RX_IGNORE;
++			}
+ 			return awdl_rx_action(frame, rssi, tsft, from, to, state);
+ 		case IEEE80211_FTYPE_DATA | IEEE80211_STYPE_DATA | IEEE80211_STYPE_QOS_DATA:
+ 			READ_LE16(frame, 0, &qosc);
+diff --git a/src/schedule.c b/src/schedule.c
+index af757bb..725f797 100644
+--- a/src/schedule.c
++++ b/src/schedule.c
+@@ -35,14 +35,44 @@ bool awdl_same_channel_as_peer(const struct awdl_state *state, uint64_t now, con
+ 	peer_slot = awdl_sync_current_eaw(now + peer->sync_offset, &state->sync) % AWDL_CHANSEQ_LENGTH;
+ 
+ 	own_chan = awdl_chan_num(state->channel.sequence[own_slot], state->channel.enc);
+-	peer_chan = awdl_chan_num(peer->sequence[peer_slot], state->channel.enc);
++	peer_chan = awdl_chan_num(peer->sequence[peer_slot], peer->sequence_enc);
++
++	/* When the radio cannot hop (a managed interface owns the channel), our
++	 * sequence says where we would like to be, not where we are. Only count
++	 * slots on the channel the radio is actually tuned to. */
++	int radio_chan = awdl_chan_num(state->channel.current, state->channel.enc);
++	if (radio_chan && radio_chan != own_chan)
++		return false;
+ 
+ 	return own_chan && (own_chan == peer_chan);
+ }
+ 
+ int awdl_is_multicast_eaw(const struct awdl_state *state, uint64_t now) {
+ 	uint16_t slot = awdl_sync_current_eaw(now, &state->sync) % AWDL_CHANSEQ_LENGTH;
+-	return slot == 0 || slot == 10;
++	int own_chan = awdl_chan_num(state->channel.sequence[slot], state->channel.enc);
++	int radio_chan = awdl_chan_num(state->channel.current, state->channel.enc);
++
++	if (state->channel.intersect) {
++		/* -I: an empty slot is one we advertise as absent; never send there. */
++		if (!own_chan || (radio_chan && own_chan != radio_chan))
++			return 0;
++		if (slot == 0 || slot == 10)
++			return 1;
++		/* Neither multicast slot is one we are on (a sending iPhone is on ch 6
++		 * only in slot 8, E0.11): use any slot we are on, or multicast never
++		 * leaves. A peer on our channel hears a broadcast in any slot. */
++		int c0 = awdl_chan_num(state->channel.sequence[0], state->channel.enc);
++		int c10 = awdl_chan_num(state->channel.sequence[10], state->channel.enc);
++		int mc_slot_ok = (c0 && (!radio_chan || c0 == radio_chan)) ||
++		                 (c10 && (!radio_chan || c10 == radio_chan));
++		return !mc_slot_ok;
++	}
++	if (slot != 0 && slot != 10)
++		return 0;
++	/* With a followed sequence the slot may name a channel the radio cannot be
++	 * on (a managed interface pins it). Sending there wastes the frame: keep it
++	 * for a multicast slot we are really on. */
++	return !radio_chan || !own_chan || own_chan == radio_chan;
+ }
+ 
+ double awdl_can_send_in(const struct awdl_state *state, uint64_t now, int guard) {
+@@ -54,7 +84,24 @@ double awdl_can_send_in(const struct awdl_state *state, uint64_t now, int guard)
+ 		(_guard - (eaw - next_aw))) : 0);
+ }
+ 
++int awdl_peer_heard_now(const struct awdl_state *state, const struct awdl_peer *peer, uint64_t now) {
++	return state->presence_us && peer->last_heard && now >= peer->last_heard &&
++	       now - peer->last_heard < state->presence_us;
++}
++
++/* The slot schedule is an estimate: slot edges come from software timestamps of
++ * the master's sync parameters, and both sequences are a snapshot the iPhone
++ * replaces several times a minute. Measured 2026-11-11: at the start of each
++ * visit the iPhone sent ~130 frames and then waited 33-43 ms for our TCP ACKs,
++ * which sat behind this gate. A frame just received from the peer is proof it
++ * is on our channel, so that overrides the estimate. */
+ double awdl_can_send_unicast_in(const struct awdl_state *state, const struct awdl_peer *peer, uint64_t now, int guard) {
++	if (awdl_peer_heard_now(state, peer, now))
++		return 0;
++	return awdl_can_send_unicast_sched_in(state, peer, now, guard);
++}
++
++double awdl_can_send_unicast_sched_in(const struct awdl_state *state, const struct awdl_peer *peer, uint64_t now, int guard) {
+ 	uint64_t next_aw = awdl_sync_next_aw_us(now, &state->sync);
+ 	uint64_t _guard = ieee80211_tu_to_usec(guard);
+ 	uint64_t eaw = ieee80211_tu_to_usec(64);
+diff --git a/src/schedule.h b/src/schedule.h
+index 7fafab7..ec0c2f5 100644
+--- a/src/schedule.h
++++ b/src/schedule.h
+@@ -69,4 +69,8 @@ double awdl_can_send_in(const struct awdl_state *state, uint64_t now, int guard)
+ 
+ double awdl_can_send_unicast_in(const struct awdl_state *state, const struct awdl_peer *peer, uint64_t now, int guard);
+ 
++double awdl_can_send_unicast_sched_in(const struct awdl_state *state, const struct awdl_peer *peer, uint64_t now, int guard);
++
++int awdl_peer_heard_now(const struct awdl_state *state, const struct awdl_peer *peer, uint64_t now);
++
+ #endif /* AWDL_SCHEDULE_H_ */
+diff --git a/src/state.c b/src/state.c
+index 6427612..d7fdf30 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -19,6 +19,7 @@
+ 
+ #include <time.h>
+ #include <string.h>
++#include <stdio.h>
+ 
+ #include "version.h"
+ #include "state.h"
+@@ -55,18 +56,35 @@ void awdl_init_state(struct awdl_state *state, const char *hostname, const struc
+ 
+ 	state->channel.enc = AWDL_CHAN_ENC_OPCLASS;
+ 	state->channel.master = chan;
+-	state->channel.current = CHAN_NULL;
++	/* OWL tunes the radio to the master channel at startup (-c). */
++	state->channel.current = chan;
+ 	//awdl_chanseq_init(state->channel.sequence);
+ 	awdl_chanseq_init_static(state->channel.sequence, &state->channel.master);
++	state->channel.follows_master = 0;
++	state->channel.follow_disabled = 0;
++	state->channel.intersect = 0;
++	state->channel.no_overlap = 0;
+ 
+ 	awdl_election_state_init(&state->election, self);
+ 
+ 	awdl_peer_state_init(&state->peers);
+ 
+ 	awdl_stats_init(&state->stats);
++
++	state->tx_rate = AWDL_TX_RATE_BASIC;
++	state->tx_mcs = -1;
++	state->tx_mcs_flags = 0;
++	memset(&state->rate_auto, 0, sizeof(state->rate_auto));
++	state->accept_addba = 0;
++	state->probe_addba = 0;
++	state->probe_addba_sent = 0;
++	state->probe_addba_last = 0;
++	state->presence_us = 0;
++	memset(&state->addba, 0, sizeof(state->addba));
+ }
+ 
+ void awdl_stats_init(struct awdl_stats *stats) {
++	memset(stats, 0, sizeof(*stats));
+ 	stats->tx_action = 0;
+ 	stats->tx_data = 0;
+ 	stats->tx_data_unicast = 0;
+@@ -105,3 +123,99 @@ uint64_t clock_time_us() {
+ 	}
+ 	return now_us;
+ }
++
++/* Rate adaptation (-r auto, -r auto-ht).
++ *
++ * A fixed rate has no way back: at MCS 15 a phone two rooms away would lose
++ * most frames and the transfer would crawl or stall. The driver reports for
++ * every injected frame whether the peer acknowledged it (after the chip's own
++ * retries), so count those in windows of 100 frames:
++ *   more than 10 % failed  -> one step slower, and wait longer before trying up again
++ *   under 2 % failed       -> after `up_after` such windows, one step faster
++ * A window left unfinished for 2 s is dropped: the few frames sent while idle
++ * (pings to a peer that is on another channel) say nothing about the rate.
++ * Measured at arm's length (2026-11-12): 0.1-0.2 % failed at every rate, so
++ * near a phone this never leaves the top step. */
++struct rate_step {
++	int8_t mcs;       /* >= 0: HT MCS, else legacy */
++	uint8_t mcs_flags;
++	uint8_t rate;     /* legacy rate, radiotap units (500 kbit/s) */
++};
++
++static const struct rate_step ladder_legacy[] = {{-1, 0, 108}, {-1, 0, 72}, {-1, 0, 48}, {-1, 0, 24}};
++/* MCS 15/13/11 = two streams 64-QAM 5/6, 64-QAM 2/3, 16-QAM 1/2; then one stream at 24 and 12 Mbit/s. */
++static const struct rate_step ladder_ht[] = {{15, 0x05, 0}, {13, 0x05, 0}, {11, 0x05, 0}, {-1, 0, 48}, {-1, 0, 24}};
++
++#define RATE_WINDOW 100
++#define RATE_WINDOW_STALE_US 2000000
++#define RATE_UP_AFTER_MIN 4
++#define RATE_UP_AFTER_MAX 32
++
++static void rate_apply(struct awdl_state *state) {
++	const struct rate_step *ladder = state->rate_auto.ladder == 2 ? ladder_ht : ladder_legacy;
++	const struct rate_step *s = &ladder[state->rate_auto.step];
++	state->tx_mcs = s->mcs;
++	state->tx_mcs_flags = s->mcs_flags;
++	state->tx_rate = s->mcs >= 0 ? AWDL_TX_RATE_BASIC : s->rate;
++}
++
++void awdl_rate_auto_init(struct awdl_state *state, int ladder) {
++	memset(&state->rate_auto, 0, sizeof(state->rate_auto));
++	state->rate_auto.ladder = (uint8_t) ladder;
++	state->rate_auto.up_after = RATE_UP_AFTER_MIN;
++	if (ladder)
++		rate_apply(state);
++}
++
++int awdl_rate_auto_feedback(struct awdl_state *state, int failed, uint64_t now) {
++	unsigned steps, total;
++	if (!state->rate_auto.ladder)
++		return 0;
++	steps = state->rate_auto.ladder == 2 ? sizeof(ladder_ht) / sizeof(ladder_ht[0])
++	                                      : sizeof(ladder_legacy) / sizeof(ladder_legacy[0]);
++	total = state->rate_auto.ok + state->rate_auto.fail;
++	if (total && now - state->rate_auto.window_start > RATE_WINDOW_STALE_US)
++		total = state->rate_auto.ok = state->rate_auto.fail = 0;
++	if (!total)
++		state->rate_auto.window_start = now;
++	if (failed)
++		state->rate_auto.fail++;
++	else
++		state->rate_auto.ok++;
++	if (++total < RATE_WINDOW)
++		return 0;
++	{
++		uint32_t fail = state->rate_auto.fail;
++		int changed = 0;
++		state->rate_auto.ok = state->rate_auto.fail = 0;
++		if (fail * 100 > total * 10) {
++			state->rate_auto.good_windows = 0;
++			if (state->rate_auto.step + 1 < steps) {
++				state->rate_auto.step++;
++				if (state->rate_auto.up_after < RATE_UP_AFTER_MAX)
++					state->rate_auto.up_after *= 2;
++				changed = 1;
++			}
++		} else if (fail * 100 < total * 2) {
++			if (state->rate_auto.step > 0 && ++state->rate_auto.good_windows >= state->rate_auto.up_after) {
++				state->rate_auto.step--;
++				state->rate_auto.good_windows = 0;
++				changed = 1;
++			}
++		} else {
++			state->rate_auto.good_windows = 0;
++		}
++		if (changed)
++			rate_apply(state);
++		return changed ? (int) fail + 1 : 0; /* failed frames of the window + 1, for the log */
++	}
++}
++
++const char *awdl_rate_str(const struct awdl_state *state, char *buf, size_t len) {
++	if (state->tx_mcs >= 0)
++		snprintf(buf, len, "HT MCS %d%s%s", state->tx_mcs, state->tx_mcs_flags & 0x01 ? ", 40 MHz" : "",
++		         state->tx_mcs_flags & 0x04 ? ", short GI" : "");
++	else
++		snprintf(buf, len, "%d Mbit/s", state->tx_rate / 2);
++	return buf;
++}
+diff --git a/src/state.h b/src/state.h
+index 3b33dd8..c9b8462 100644
+--- a/src/state.h
++++ b/src/state.h
+@@ -41,11 +41,30 @@ struct awdl_stats {
+ 	uint64_t tx_data;
+ 	uint64_t tx_data_unicast;
+ 	uint64_t tx_data_multicast;
++	uint64_t tx_data_multicast_dropped;
+ 	uint64_t rx_action;
+ 	uint64_t rx_data;
+ 	uint64_t rx_unknown;
++	/* TX status of our unicast data frames, from the copies mac80211 hands
++	 * back on the monitor interface (radiotap TX flags) */
++	uint64_t tx_status_ok;
++	uint64_t tx_status_fail;
++	uint64_t rx_addba;
++	uint64_t tx_presence; /* unicast frames the slot schedule would have held back */
+ };
+ 
++/* A peer's Block Ack request waiting for our answer (see -A) */
++struct awdl_addba_request {
++	uint8_t pending;
++	struct ether_addr peer;
++	uint8_t token;
++	uint16_t params;
++	uint16_t timeout;
++};
++
++/* 12 Mbit/s in radiotap units: what every AWDL device receives */
++#define AWDL_TX_RATE_BASIC 24
++
+ /* Complete node state */
+ struct awdl_state {
+ 	struct ether_addr self_address;
+@@ -75,6 +94,48 @@ struct awdl_state {
+ 
+ 	int filter_rssi; /* whether or not to filter (default: true) */
+ 	signed char rssi_threshold; /* peers exceeding this threshold are discovered */
++	/* -S: advertise a single-band (2.4 GHz only) peer in data-path state: clears
++	 * "dual band" (0x0020), for a radio held on ch 6 (experiment E2.8). */
++	uint8_t dps_single_band;
++	/* -C CH: advertise infra channel CH (BSSID zeroed) in data-path state (E2.9). */
++	uint8_t dps_infra_channel;
++	/* -H: advertise 40 MHz in HT caps (only honest when the radio's chanctx is 40 MHz;
++	 * the helper sets it with a HT40 GO). Lifts the iPhone's TX from HT20 to HT40 (E0.11). */
++	uint8_t ht40;
++	/* -V: also advertise VHT 80 MHz (TLV 0x11 with a VHT Capabilities element, as the iPhone
++	 * sends it); only honest when the radio's chanctx is 80 MHz (helper --vht80, E-VHT80). */
++	uint8_t vht80;
++	/* -R: set the data-path-state real-time bit (0x2000); test whether the iPhone
++	 * then commits more airtime to our channel (duty-cycle lever, E0.11). */
++	uint8_t realtime;
++	/* -r: rate of unicast data frames. tx_rate in radiotap units (500 kbit/s);
++	 * tx_mcs >= 0 selects an HT MCS instead (needs a driver that honours it).
++	 * Action frames and multicast always go out at 12 Mbit/s. */
++	uint8_t tx_rate;
++	int8_t tx_mcs;
++	uint8_t tx_mcs_flags; /* radiotap MCS flags: 0x01 = 40 MHz, 0x04 = short GI */
++	/* -r auto / auto-ht: start at the fastest rate of a ladder and step down
++	 * while the peer fails to acknowledge our frames, back up when it does. */
++	struct {
++		uint8_t ladder;   /* 0 = fixed rate, 1 = legacy rates, 2 = HT rates first */
++		uint8_t step;
++		uint32_t ok, fail;
++		uint32_t good_windows, up_after;
++		uint64_t window_start;
++	} rate_auto;
++	/* -A: answer a peer's ADDBA request (it then sends A-MPDUs). Only useful
++	 * where the hardware answers A-MPDUs with a Block Ack by itself. */
++	uint8_t accept_addba;
++	/* -B (E-TXAGG probe): ask a peer for a Block Ack session ourselves, a few times, and only
++	 * log what it answers. Nothing is aggregated; it tells whether an iPhone accepts a
++	 * request from an AWDL peer at all. */
++	uint8_t probe_addba;
++	uint8_t probe_addba_sent;
++	uint64_t probe_addba_last;
++	/* -p MS: a peer we heard less than this long ago is on our channel now,
++	 * whatever the slot arithmetic says: unicast to it may go out (0 = off). */
++	uint32_t presence_us;
++	struct awdl_addba_request addba;
+ 	signed char rssi_grace; /* once discovered accept lower RSSI */
+ 
+ 	struct awdl_election_state election;
+@@ -104,4 +165,13 @@ unsigned int ieee80211_state_next_sequence_number(struct ieee80211_state *);
+ 
+ uint64_t clock_time_us();
+ 
++/* Rate ladder for -r auto (ladder 1) / -r auto-ht (ladder 2). */
++void awdl_rate_auto_init(struct awdl_state *state, int ladder);
++
++/* TX status of one unicast data frame of ours; returns 1 if the rate changed. */
++int awdl_rate_auto_feedback(struct awdl_state *state, int failed, uint64_t now);
++
++/* Text for the current unicast rate, e.g. "HT MCS 15, 40 MHz, short GI" or "24 Mbit/s". */
++const char *awdl_rate_str(const struct awdl_state *state, char *buf, size_t len);
++
+ #endif /* AWDL_STATE_H_ */
+diff --git a/src/tx.c b/src/tx.c
+index b98db03..ee3802c 100644
+--- a/src/tx.c
++++ b/src/tx.c
+@@ -229,43 +229,84 @@ int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *state _
+ 	tlv->type = AWDL_ENHANCED_DATA_RATE_CAPABILITIES_TLV;
+ 	tlv->length = htole16(sizeof(struct awdl_ht_capabilities_tlv) - sizeof(struct tl));
+ 
+-	/* TODO extract capabilities from nl80211 (nl80211_band_attr) */
+-	tlv->ht_capabilities = htole16(0x11ce);
++	/* Advertise what our 2x2 MT7921 can actually receive, so a sending iPhone
++	 * is not held to 1-stream rates. The iPhone offers 40 MHz + 2 streams
++	 * (measured TLV 0x07 `6f 88 1b ff ff`); throughput is duty-cycle bound, so
++	 * every extra bit/slot counts (E0.11: 65 Mbit/s MCS 7 bursts, 1 stream).
++	 * 20 MHz is kept (our GO/monitor is 20 MHz; claiming 40 MHz we cannot
++	 * receive would make the iPhone's wide frames fail and it would back off).
++	 * 0x11ce | 0x0020 sets Short-GI 20 MHz; the MCS field spans both streams. */
++	/* 0x0002 = supported channel width set 20/40; added by -H when the GO is HT40. */
++	tlv->ht_capabilities = htole16((0x11ce | 0x0020) | (state->ht40 ? 0x0002 : 0));
+ 	tlv->ampdu_params = 0x1b;
+-	tlv->rx_mcs = 0xff; /* one stream, all MCS */
+-
++	tlv->rx_mcs = 0xff;              /* stream 1: MCS 0-7  */
+ 	tlv->unknown = htole16(0);
+-	tlv->unknown2 = htole16(0);
++	tlv->unknown2 = htole16(0x00ff); /* low byte = stream 2: MCS 8-15 -> `ff ff` as the iPhone sends */
+ 
+ 	return sizeof(struct awdl_ht_capabilities_tlv);
+ }
+ 
+-int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *state) {
+-	struct awdl_data_path_state_tlv *tlv = (struct awdl_data_path_state_tlv *) buf;
+-
+-	tlv->type = AWDL_DATA_PATH_STATE_TLV;
+-	tlv->length = htole16(sizeof(struct awdl_data_path_state_tlv) - sizeof(struct tl));
+-
+-	/* TODO this is very ugly currently */
+-	tlv->flags = htole16(0x8f24);
+-
+-	tlv->awdl_addr = state->self_address;
+-
+-	tlv->country_code[0] = 'X';
+-	tlv->country_code[1] = '0';
+-	tlv->country_code[2] = 0;
++/* E-VHT80: the iPhone sends its VHT capabilities as a plain 802.11 VHT Capabilities element
++ * (ID 191) inside TLV 0x11 (measured 2026-11-13: `bf 0c 76f0b113 faff0000 faff0020`).
++ * Ours claims only what the monitor pair can receive at 80 MHz: RX LDPC (0x10), short GI
++ * 80 MHz (0x20), A-MPDU length exponent 3 (64 KiB, as ampdu_params 0x1b in the HT TLV), no
++ * beamforming (we cannot answer sounding); 2 streams MCS 0-9 (map 0xfffa) both ways. */
++int awdl_init_vht_capabilities_tlv(uint8_t *buf, const struct awdl_state *state) {
++	if (!state->vht80)
++		return 0;
++	uint8_t *p = buf;
++	uint32_t cap = htole32(0x00000030 | (3u << 23));
++	uint16_t map = htole16(0xfffa), zero = 0;
++	*p++ = AWDL_IEEE80211_CNTNR_TLV;
++	uint16_t len = htole16(2 + 12);
++	memcpy(p, &len, 2), p += 2;
++	*p++ = 191; /* VHT Capabilities */
++	*p++ = 12;
++	memcpy(p, &cap, 4), p += 4;
++	memcpy(p, &map, 2), p += 2;  /* RX MCS map */
++	memcpy(p, &zero, 2), p += 2; /* RX highest rate: from the map */
++	memcpy(p, &map, 2), p += 2;  /* TX MCS map */
++	memcpy(p, &zero, 2), p += 2; /* TX highest rate */
++	return (int) (p - buf);
++}
+ 
+-	if (awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS) == 6)
+-		tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_6_BIT);
+-	else if (awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS) == 44) {
+-		tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_44_BIT);
+-	} else { // 149
+-		tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_149_BIT);
++int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *state) {
++	/* Layout (Wireshark awdl.datastate, matched byte for byte against an iPhone,
++	 * docs/PROTOCOL.md 3.3): flags, country(3), social map(2), [infra BSSID(6) +
++	 * infra channel(2) if 0x0001], AWDL address(6) (0x0004), ext flags(2) (0x8000). */
++	uint8_t *p = buf + sizeof(struct tl);
++	uint16_t flags = 0x8f24;
++	uint16_t social;
++	uint8_t master = awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS);
++
++	if (state->dps_single_band)
++		flags &= ~0x0020; /* -S: no "dual band" */
++	if (state->dps_infra_channel)
++		flags |= 0x0001;  /* -C: infra BSSID (zeroed, as iOS sends it) + channel */
++	if (state->realtime)
++		flags |= 0x2000; /* -R: data-path "real-time" bit the iPhone sets during its own transfers (S-20) */
++
++	if (master == 6)
++		social = AWDL_SOCIAL_CHANNEL_6_BIT;
++	else if (master == 44)
++		social = AWDL_SOCIAL_CHANNEL_44_BIT;
++	else /* 149 */
++		social = AWDL_SOCIAL_CHANNEL_149_BIT;
++
++	*(uint16_t *) p = htole16(flags); p += 2;
++	*p++ = 'X'; *p++ = '0'; *p++ = 0;
++	*(uint16_t *) p = htole16(social); p += 2;
++	if (flags & 0x0001) {
++		memset(p, 0, 6); p += 6;
++		*(uint16_t *) p = htole16(state->dps_infra_channel); p += 2;
+ 	}
++	memcpy(p, &state->self_address, 6); p += 6;
++	*(uint16_t *) p = htole16(0x0000); p += 2;
+ 
+-	tlv->ext_flags = htole16(0x0000);
+-
+-	return sizeof(struct awdl_data_path_state_tlv);
++	struct tl *tl = (struct tl *) buf;
++	tl->type = AWDL_DATA_PATH_STATE_TLV;
++	tl->length = htole16((uint16_t) (p - buf - sizeof(struct tl)));
++	return (int) (p - buf);
+ }
+ 
+ int awdl_init_arpa_tlv(uint8_t *buf, const struct awdl_state *state) {
+@@ -294,7 +335,7 @@ int awdl_init_version_tlv(uint8_t *buf, const struct awdl_state *state) {
+ 	return sizeof(struct awdl_version_tlv);
+ }
+ 
+-int ieee80211_init_radiotap_header(uint8_t *buf) {
++int ieee80211_init_radiotap_header(uint8_t *buf, const struct awdl_state *state, int unicast_data) {
+ 	/*
+ 	 * TX radiotap headers and mac80211
+ 	 * https://www.kernel.org/doc/Documentation/networking/mac80211-injection.txt
+@@ -306,11 +347,17 @@ int ieee80211_init_radiotap_header(uint8_t *buf) {
+ 	hdr->it_version = 0;
+ 	hdr->it_pad = 0;
+ 
+-	/* TODO Adjust PHY parameters based on receiver capabilities */
+-
+-	present |= ieee80211_radiotap_type_to_mask(IEEE80211_RADIOTAP_RATE);
+-	*ptr = htole16(ieee80211_radiotap_rate_to_val(12));
+-	ptr += sizeof(uint8_t);
++	/* Action frames and multicast: 12 Mbit/s, which every AWDL device receives.
++	 * Unicast data: the configured rate (-r). There is no rate control. */
++	if (unicast_data && state && state->tx_mcs >= 0) {
++		present |= ieee80211_radiotap_type_to_mask(IEEE80211_RADIOTAP_MCS);
++		*ptr++ = 0x01 | 0x02 | 0x04; /* known: bandwidth, MCS index, guard interval */
++		*ptr++ = state->tx_mcs_flags;
++		*ptr++ = (uint8_t) state->tx_mcs;
++	} else {
++		present |= ieee80211_radiotap_type_to_mask(IEEE80211_RADIOTAP_RATE);
++		*ptr++ = (unicast_data && state && state->tx_rate) ? state->tx_rate : AWDL_TX_RATE_BASIC;
++	}
+ 
+ 	hdr->it_len = htole16((uint16_t) (ptr - buf));
+ 	hdr->it_present = htole32(present);
+@@ -360,11 +407,71 @@ int ieee80211_add_fcs(const uint8_t *start, uint8_t *end) {
+ 	return sizeof(uint32_t);
+ }
+ 
++/* AWDL-15 (owly SPEC): accept a peer's Block Ack session. Immediate Block Ack,
++ * the requested TID, no A-MSDU inside A-MPDUs, window as requested (max 64),
++ * the requested timeout. */
++int ieee80211_init_addba_response(uint8_t *buf, const struct awdl_state *state,
++                                  struct ieee80211_state *ieee80211_state) {
++	uint8_t *ptr = buf;
++	const struct awdl_addba_request *req = &state->addba;
++	uint16_t window = (req->params >> 6) & 0x3ff;
++	uint16_t params;
++
++	if (window == 0 || window > 64)
++		window = 64;
++	params = (uint16_t) ((req->params & 0x003c) | 0x0002 | (window << 6));
++
++	ptr += ieee80211_init_radiotap_header(ptr, state, 0);
++	ptr += ieee80211_init_awdl_action_hdr(ptr, &state->self_address, &req->peer, ieee80211_state);
++	*ptr++ = 3; /* category: Block Ack */
++	*ptr++ = 1; /* ADDBA response */
++	*ptr++ = req->token;
++	*ptr++ = 0; /* status: success */
++	*ptr++ = 0;
++	*ptr++ = params & 0xff;
++	*ptr++ = params >> 8;
++	*ptr++ = req->timeout & 0xff;
++	*ptr++ = req->timeout >> 8;
++	if (ieee80211_state->fcs)
++		ptr += ieee80211_add_fcs(buf, ptr);
++
++	return ptr - buf;
++}
++
++/* -B: an ADDBA request as the iPhone sends it to us (TID 0, immediate, window 64, A-MSDU
++ * bit set, BSSID = AWDL), without a timeout. ssn_in is the number of the next QoS Data frame
++ * to that peer (-G), or -1 for the probe, where no data frame of ours depends on it. */
++int ieee80211_init_addba_request(uint8_t *buf, const struct awdl_state *state, struct ieee80211_state *ieee80211_state,
++                                 const struct ether_addr *peer, uint8_t token, int ssn_in) {
++	uint8_t *ptr = buf;
++	struct ieee80211_hdr *hdr;
++	uint16_t ssn;
++
++	ptr += ieee80211_init_radiotap_header(ptr, state, 0);
++	hdr = (struct ieee80211_hdr *) ptr;
++	ptr += ieee80211_init_awdl_action_hdr(ptr, &state->self_address, peer, ieee80211_state);
++	/* the start sequence number field holds the number in its upper 12 bits */
++	ssn = ssn_in >= 0 ? (uint16_t) ((ssn_in & 0xfff) << 4) : (uint16_t) (le16toh(hdr->seq_ctrl) + 0x10);
++	*ptr++ = 3; /* category: Block Ack */
++	*ptr++ = 0; /* ADDBA request */
++	*ptr++ = token;
++	*ptr++ = 0x03; /* 0x1003: A-MSDU, immediate, TID 0, window 64 */
++	*ptr++ = 0x10;
++	*ptr++ = 0; /* no timeout */
++	*ptr++ = 0;
++	*ptr++ = ssn & 0xff;
++	*ptr++ = ssn >> 8;
++	if (ieee80211_state->fcs)
++		ptr += ieee80211_add_fcs(buf, ptr);
++
++	return ptr - buf;
++}
++
+ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct ieee80211_state *ieee80211_state,
+                                 enum awdl_action_type type) {
+ 	uint8_t *ptr = buf;
+ 
+-	ptr += ieee80211_init_radiotap_header(ptr);
++	ptr += ieee80211_init_radiotap_header(ptr, state, 0);
+ 	ptr += ieee80211_init_awdl_action_hdr(ptr, &state->self_address, &state->dst, ieee80211_state);
+ 	ptr += awdl_init_action(ptr, type);
+ 	ptr += awdl_init_sync_params_tlv(ptr, state);
+@@ -374,6 +481,8 @@ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct i
+ 	ptr += awdl_init_service_params_tlv(ptr, state);
+ 	if (type == AWDL_ACTION_MIF)
+ 		ptr += awdl_init_ht_capabilities_tlv(ptr, state);
++	if (type == AWDL_ACTION_MIF)
++		ptr += awdl_init_vht_capabilities_tlv(ptr, state);
+ 	if (type == AWDL_ACTION_MIF)
+ 		ptr += awdl_init_arpa_tlv(ptr, state);
+ 	ptr += awdl_init_data_path_state_tlv(ptr, state);
+@@ -386,11 +495,32 @@ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct i
+ 
+ int awdl_init_full_data_frame(uint8_t *buf, const struct ether_addr *src, const struct ether_addr *dst,
+                               const uint8_t *payload, unsigned int plen,
+-                              struct awdl_state *state, struct ieee80211_state *ieee80211_state) {
++                              struct awdl_state *state, struct ieee80211_state *ieee80211_state, int qos_seq) {
+ 	uint8_t *ptr = buf;
+ 
+-	ptr += ieee80211_init_radiotap_header(ptr);
+-	ptr += ieee80211_init_awdl_data_hdr(ptr, src, dst, ieee80211_state);
++	if (qos_seq >= 0) {
++		/* -G: the peer is a station of our access-point interface. No rate in the radiotap
++		 * header, so the firmware's rate control applies. QoS Data on TID 0 with our own
++		 * sequence number (TX flag 0x0010: mac80211 leaves it alone), because the Block Ack
++		 * session we ask the peer for starts at a number only we know. */
++		struct ieee80211_radiotap_header *rt = (struct ieee80211_radiotap_header *) ptr;
++		struct ieee80211_hdr *hdr;
++		memset(rt, 0, sizeof(*rt));
++		rt->it_len = htole16(sizeof(*rt) + 2);
++		rt->it_present = htole32(ieee80211_radiotap_type_to_mask(IEEE80211_RADIOTAP_TX_FLAGS));
++		ptr += sizeof(*rt);
++		*ptr++ = 0x10; /* IEEE80211_RADIOTAP_F_TX_NOSEQNO */
++		*ptr++ = 0x00;
++		hdr = (struct ieee80211_hdr *) ptr;
++		ptr += ieee80211_init_awdl_hdr(ptr, src, dst, ieee80211_state,
++		                               IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA);
++		hdr->seq_ctrl = htole16((uint16_t) ((qos_seq & 0xfff) << 4));
++		*ptr++ = 0; /* QoS control: TID 0, normal ack policy */
++		*ptr++ = 0;
++	} else {
++		ptr += ieee80211_init_radiotap_header(ptr, state, !(dst->ether_addr_octet[0] & 0x01));
++		ptr += ieee80211_init_awdl_data_hdr(ptr, src, dst, ieee80211_state);
++	}
+ 	ptr += llc_init_awdl_hdr(ptr);
+ 	ptr += awdl_init_data(ptr, state);
+ 	memcpy(ptr, payload, plen);
+diff --git a/src/tx.h b/src/tx.h
+index 57586bd..2afec20 100644
+--- a/src/tx.h
++++ b/src/tx.h
+@@ -45,6 +45,8 @@ int awdl_init_service_params_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+ int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *);
+ 
++int awdl_init_vht_capabilities_tlv(uint8_t *buf, const struct awdl_state *);
++
+ int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+ int awdl_init_arpa_tlv(uint8_t *buf, const struct awdl_state *);
+@@ -57,9 +59,15 @@ int awdl_init_data(uint8_t *buf, struct awdl_state *);
+ 
+ int awdl_init_full_data_frame(uint8_t *buf, const struct ether_addr *src, const struct ether_addr *dst,
+                               const uint8_t *payload, unsigned int plen,
+-                              struct awdl_state *, struct ieee80211_state *);
++                              struct awdl_state *, struct ieee80211_state *, int qos_seq);
++
++int ieee80211_init_radiotap_header(uint8_t *buf, const struct awdl_state *state, int unicast_data);
++
++int ieee80211_init_addba_request(uint8_t *buf, const struct awdl_state *state, struct ieee80211_state *ieee80211_state,
++                                 const struct ether_addr *peer, uint8_t token, int ssn);
+ 
+-int ieee80211_init_radiotap_header(uint8_t *buf);
++int ieee80211_init_addba_response(uint8_t *buf, const struct awdl_state *state,
++                                  struct ieee80211_state *ieee80211_state);
+ 
+ int ieee80211_init_awdl_hdr(uint8_t *buf, const struct ether_addr *src, const struct ether_addr *dst,
+                             struct ieee80211_state *, uint16_t type);

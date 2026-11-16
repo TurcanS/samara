@@ -1,0 +1,14 @@
+// Optional: let members of the "airdrop" group start AirDrop without a password.
+// Needed only for the background receiver (airdrop-receive.service), because a
+// systemd --user service has no terminal or polkit agent to ask for one.
+//
+//   sudo groupadd -r airdrop && sudo gpasswd -a "$USER" airdrop
+//   sudo install -Dm644 50-airdrop-background.rules.example /etc/polkit-1/rules.d/50-airdrop-background.rules
+//
+// The helper only accepts validated arguments (interface name, mode, channel).
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.airdrop.helper" && subject.local && subject.active &&
+        subject.isInGroup("airdrop")) {
+        return polkit.Result.YES;
+    }
+});
