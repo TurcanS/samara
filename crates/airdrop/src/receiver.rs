@@ -243,7 +243,7 @@ async fn handle(inner: &Arc<Inner>, tcp: TcpStream, peer: SocketAddr) {
             verbose!("bad request line from {ip}: {:?}", head.start);
             break;
         };
-        verbose!("{method} {path} from {ip}");
+        verbose!("{} {} from {ip}", clean(&method), clean(&path));
         inner.activity.touch();
         inner.activity.requests.fetch_add(1, Ordering::Relaxed);
         if head.headers.get("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) && conn.write_all(http::CONTINUE).await.is_err() {
@@ -307,7 +307,7 @@ async fn dispatch(inner: &Arc<Inner>, method: &str, path: &str, head: &Head, con
             if let Some(d) = &inner.dump {
                 d.request(&peer, method, path, headers_json(&head.headers), &body, Some(status), Some("unknown path"));
             }
-            eprintln!("Request for {path} from {peer}: not implemented, answered {status}.");
+            eprintln!("Request for {} from {peer}: not implemented, answered {status}.", clean(path));
             let empty = if status == 200 { wire::dumps(Default::default()) } else { Vec::new() };
             reply(conn, status, &empty, true).await // 400: owly HTTP-5
         }
