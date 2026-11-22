@@ -176,6 +176,43 @@ airdrop config set channel auto          # auto, 6, 36, 44 or 149
 airdrop config known add "Anna's iPhone"
 ```
 
+## Machine interface (`--json`)
+For a desktop shell that draws its own AirDrop interface. With `--json`, stdout carries
+only events, one JSON object per line with an `"event"` key; the human text goes to stderr. Commands
+are JSON lines on stdin. `{"done": true}`, or stdin closing, stops the command as Ctrl-C does
+(teardown included), so a crashed shell never leaves Wi-Fi paused. Received links are never opened.
+
+```
+airdrop --json send [-t IDLE_SECONDS]           # devices live; send what each pick names
+airdrop --json receive --ask [--ask-timeout S]  # visible now; questions answered on stdin
+airdrop --json listen --ask                     # background; visible when an iPhone opens AirDrop
+airdrop --json doctor | config show             # one `doctor` / `config` event
+```
+
+| Event | Fields |
+|---|---|
+| `session` | `phase` starting / up / down, `mode`, `channel`, `wifi_paused` (up), `wifi_restored` (down) |
+| `notice`, `warning` | `message` |
+| `error` | `code` (`auth`, `helper`, `busy`, `link`, `bluetooth`, `config`, `start`, `input`), `message` |
+| `searching`, `search_end` | send: the list is live; ended after IDLE seconds with nothing picked (`found`, `hint`) |
+| `peer`, `peer_lost` | send: `id`, `name`, `model`, `kind` (iphone / ipad / mac / other), `available` |
+| `visible` | `name`, `dir`, `port` |
+| `listen` | `state` idle / triggered |
+| `ask` | `id`, `sender`, `model`, `kind`, `known`, `asking` (someone has to answer), `timeout`, `files` [{`name`, `uti`, `size`, `dir`}], `urls`, `total`, `icon` (the sender's preview saved under `$XDG_RUNTIME_DIR/airdrop/<pid>/`, or null) |
+| `answered` | `id`, `decision` accept / always / decline, `by` user / timeout / known / auto |
+| `transfer` | `id`, `dir` in / out, `phase` asking / sending / receiving / done / declined / failed / cancelled; `peer` (out), `sender`, `total`, `saved`, `bytes`, `seconds`, `message` |
+| `progress` | `id`, `done`, `total`, `rate` (bytes/s), at most five a second |
+| `link` | `id`, `url`, `sender` |
+
+| Command | Meaning |
+|---|---|
+| `{"pick": PEER_ID, "paths": ["/abs/path", ...]}` or `{"pick": PEER_ID, "url": "https://..."}` | send; one transfer at a time per session |
+| `{"cancel": ID}` | stop that outgoing transfer (the receiver keeps nothing) |
+| `{"answer": "accept" \| "always" \| "decline", "id": ID}` | answer an `ask` |
+| `{"done": true}` | end the session (a running send finishes first) |
+
+The QA tests whose names start with `test_shell_` drive it as the shell does.
+
 ## Measure it yourself
 
 ```sh
