@@ -17,10 +17,12 @@ Rules for every entry:
 - Raw result: session folder under `probe/sessions/`, frames, symbols.
 - Conclusion, and the doc sections it changed.
 
-**Where things stand (2026-11-16), newest conclusions first; search the heading to find the entry:**
+**Where things stand (2026-11-22), newest conclusions first; search the heading to find the entry:**
 
 | Question | Answer | Entry |
 |---|---|---|
+| Why is the Realtek rtw89 laptop slow (send 0.2, receive 0.56 MB/s)? | The chip holds frames for a peer without a station entry (the AP's own mac_id, 17 every ~140 ms). Station entry (OWL `-g`, default on rtw89): **send 5.5, receive 20.5 MB/s** | "E-RTW89 Phase 0" (2026-11-22) |
+| Can rtw89 aggregate what we send? | **Yes: 5.5 → 40.5 MB/s** (receive 25.2) with our rtw89 build (`awdl_ba`) | "E-RTW89 F1" (2026-11-22) |
 | Which open spec rows do the recorded sessions already answer? | Q-A1, Q-D1, Q-T3; three archive layouts; a second request form | "C-1" (2026-11-16) |
 | Can the firmware aggregate what we send? | **Yes: 5.4 → 30.6 MB/s.** Station entry on the GO, Block Ack asked by OWL during the transfer, driver `awdl_ba`, HT/VHT elements in the GO beacon | "E-TXAGG ..." (six entries, 2026-11-15/16) |
 | Can mac80211 negotiate that session? Force the width per frame? | No (never answered; stall). No (ignored) | "E-TXAGG live result", "E-TXAGG re-run with the asking fix" |
@@ -1482,7 +1484,7 @@ the same item (the first line of each entry).
   grep -E 'station' /run/airdrop-owl.log; grep -E 'station|awdl_ba' /run/airdrop-helper.log | tail -30
   ```
 - Predictions, in the order they can fail (each has its own line of evidence):
-  1. `owl.log`: `station: registered <iPhone> (HT caps 0x886f, 2 streams, VHT)`. Refuted by `could not register`
+  1. `owl.log`: `station: registered 02:00:00:00:00:0a (HT caps 0x886f, 2 streams, VHT)`. Refuted by `could not register`
      (the error names why: the kernel or the driver refused the entry).
   2. The send still completes (frames to a station leave the radio and the iPhone accepts QoS Data from us).
      Refuted if B never connects or stalls while A works; then `--tx-agg` is off again by not passing it.
@@ -1680,3 +1682,67 @@ grep 'Block Ack' /run/airdrop-owl.log
   send from another room (the firmware's rate control stepping down); receive with a station entry (not planned).
 - Leftovers in the tree, harmless: driver parameter `awdl_bw` and helper `--tx-agg-bw` (refuted), OWL `-B` /
   helper `--ba-probe` (the probe).
+
+### E-RTW89 Phase 0 (2026-11-22, second laptop: RTL8852BE `rtw89_8852be`, stock driver, kernel 7.3.5-arch1-1, borrow on 149 at 80 MHz) — **confirmed: 0.2 → 5.6 MB/s with a station entry; default for rtw89**
+- Question: why does the same code send at 0.15-0.25 MB/s on rtw89 (MT7921 single frames: 5.4 MB/s)?
+- Earlier the same day (`20261122-104635-rtw-send`): the chip sends exactly 17 frames,
+  the iPhone ACKs within ~2 ms, then ~140 ms of silence; frames wait a median 424 ms between mac80211's monitor
+  xmit and their TX status; mac80211 queues empty. Refuted then: rate, BT coex, scans, power saving, AQL/airtime,
+  dynamic EDCCA/DIG.
+- Hypothesis: injected frames without a station go out under the access point's own mac_id
+  (`rtw89_core_tx_get_mac_id`), whose MAC queue the firmware serves in bursts. Prediction: with the iPhone as a
+  station of the GO the bursts disappear and the rate approaches 5 MB/s.
+- Setup: `scripts/rtw89-phase0.sh DEVICE FILE` (417 MB video, P-RECV, 40 s runs), A = as now, B = helper `--tx-sta`
+  (OWL `-g awdlgo`: station entry, no Block Ack request, OWL's radiotap rate kept), C = `--no-ampdu` (did not run:
+  the iPhone did not engage).
+- TXBD indexes of ACH0 (debugfs `read_reg 1058 10`, 50 ms): host == hw in every sample of A (`00f900f9`): the chip
+  has fetched the frames; they wait inside the MAC.
+
+| 40 s send | A as now (`112732-p0-A`) | B station entry (`112824-p0-B`) |
+|---|---|---|
+| speed | 202 KB/s | **5.6 MB/s** (170.5 MB in ~30 s) |
+| our frames ACKed on air | 4104 (bursts of 17, gaps 110-160 TU) | 124,006; 6 gaps >= 100 ms |
+| 16 TU slots used | 13 % | 83 % |
+| iPhone's frames to us retried | 61 % | 10 % |
+| rate | MCS 15/40 | MCS 15/40 throughout, 0 lost; station dump 0 retries / 15 failed of 124 k |
+
+- Conclusion: confirmed. mac80211 attaches the station to injected unicast (tx.c `sta_info_get(sdata, addr1)`) and
+  rtw89 then uses the iPhone's own mac_id and address entry. mac80211 cannot start its own BA session here (no
+  software rate control on rtw89). Made the default: `crates/airdrop-helper/src/driver.rs`
+  (`Family::needs_station`) turns the client's `--tx-agg` into OWL `-g awdlgo` on rtw89.
+- Follow-up runs (11:39-11:45, helper with the rtw89 default installed):
+  - Plain `airdrop send -r testphone` (no flags): **416.8 MB in 75.2 s, 5.5 MB/s**. The default works end to end.
+  - C (`--no-ampdu` on top of the station default, `114036-p0-C`): 4.9 MB/s. Refusing the iPhone's Block Ack costs
+    a little; keep `-A`.
+  - Receive, the iPhone sending the same 417 MB video: plain `airdrop receive` (no station entry) 563 KB/s (stopped at
+    3.5 %); `AIRDROP_HELPER_ARGS=--tx-sta airdrop receive`: **416.8 MB in 20.3 s, 20.5 MB/s** (MT7921: 21.0).
+    The chip's handling of the iPhone's A-MPDUs needs the station entry too; no driver change (planned F2) needed.
+- Made the default for **every borrow session on rtw89** (send, receive, listen): `start_owl` uses `-g awdlgo` when
+  `Family::needs_station()` and no aggregating build is loaded.
+- Left: aggregated sending (5.5 → ~30 MB/s on MT7921) needs a patched rtw89 (plan F1).
+
+### E-RTW89 F1 (2026-11-22 11:57, RTL8852BE, our rtw89 build) — **confirmed: send 5.5 → 40.5 MB/s, receive 20.5 → 25.2 MB/s**
+- Question: does the MT7921 `awdl_ba` recipe carry over to rtw89?
+- Build: `driver/rtw89-awdl.diff` (core.c/core.h, ~160 lines) on v7.3.5, `scripts/rtw89-build.sh`, all five 8852BE
+  modules swapped with `scripts/rtw89-load.sh load`. The unpatched build of the same tree is byte-identical to
+  Arch's modules (symbols and `.text`); the patched one changes `struct rtw89_dev`, so the stack is only swapped
+  together.
+- Patch, behind `rtw89_core` parameter `awdl_ba` (helper: on for every rtw89 borrow session, restored after):
+  an AWDL-format ADDBA response (status 0) from a station switches firmware aggregation on for it (as
+  `IEEE80211_AMPDU_TX_OPERATIONAL`); DELBA from the recipient off; injected frames never start mac80211's own
+  session (Phase 0 B had 6 unanswered mac80211 ADDBA requests, each stopping the queue up to 1 s); injected
+  frames without a radiotap rate keep firmware rate control. Helper: OWL `-G`, HT/VHT in the GO beacon.
+- Prediction: `awdl_ba: ... aggregation on` in the kernel log and >= 20 MB/s.
+- Result:
+  - `airdrop send -r testphone` 417 MB video: **416.8 MB in 10.3 s, 40.5 MB/s** (MT7921 best: 30.6). OWL asked once
+    ("request 64, starting at 0"), the iPhone agreed at once; kernel: `awdl_ba: 02:00:00:00:00:0a tid 0: aggregation
+    on (window 64)`. Station dump at teardown: 302,967 tx packets, **0 retries, 0 failed**, tx bitrate
+    **866.7 Mbit/s VHT-MCS 9 80 MHz short GI NSS 2**.
+  - `airdrop receive`, the same video from the iPhone: **416.8 MB in 16.5 s, 25.2 MB/s** (stock + station: 20.5;
+    MT7921: 21.0). The receive session also got "aggregation on" (OWL asks before bulk frames it sends).
+  - `awdl_ba` back to N after each session (`restore awdl_ba` in the helper log). No warnings; the only other
+    kernel line is rtw89's `timed out to flush queues` when the GO stops, which the stock driver printed in
+    earlier sessions too (frames left for a peer that went off channel; teardown 1.4 s instead of ~1.0).
+- Conclusion: confirmed. rtw89 + this build is the fastest card so far in both directions.
+- Open: soak (several sends, a multi-GB file, listen, suspend/resume, a day of normal Wi-Fi with the build loaded);
+  a send from another room (firmware rate control stepping down).

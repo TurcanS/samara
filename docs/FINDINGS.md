@@ -1,11 +1,11 @@
 # Findings
 
 What two weeks of measuring AirDrop between one Linux laptop (MediaTek MT7921, one radio) and one iPhone 17
-(iOS 27.2) turned up. Each entry names the entry in [`EXPERIMENTS.md`](EXPERIMENTS.md) that holds the raw result
+(iOS 27.2) turned up, and what a second laptop (Realtek RTL8852BE) added (findings 14-16). Each entry names the entry in [`EXPERIMENTS.md`](EXPERIMENTS.md) that holds the raw result
 (search for the quoted heading) and says how to repeat it.
 
-Everything here was measured on that one pair of devices. Treat it as a set of leads for other hardware, not as
-general truths.
+Everything here was measured on those devices. Treat it as a set of leads for other hardware, not as general
+truths; [`wiki/Faster-on-your-card.md`](wiki/Faster-on-your-card.md) turns them into a checklist.
 
 ## How to repeat a measurement
 
@@ -13,6 +13,7 @@ general truths.
 NAME=rx   DUR=120 scripts/airdrop-trace.sh --mode borrow                          # the iPhone sends to you
 NAME=send DUR=120 scripts/airdrop-trace.sh send --mode borrow -r "device name" FILE
 python3 -I scripts/analyze-trace.py probe/sessions/<folder>
+python3 -I scripts/air-check.py probe/sessions/<folder>       # what holds the card back, with the likely cause
 ```
 
 A trace needs sudo for the packet capture and writes one folder per run: client log, OWL log, the air capture,
@@ -146,6 +147,46 @@ Entry: "E1.4". Repeat on your own phone: `scripts/ble-airdrop.py` on a `btmon` l
 Most of a start was waiting for things the scan guard had already made unnecessary.
 
 Entry: "Bring-up latency".
+
+## A second card: Realtek RTL8852BE (`rtw89`, kernel 7.3.5)
+
+### 14. Every MediaTek assumption made the Realtek slow
+
+The same code sent at 0.2 MB/s on the second laptop. The helper chose its fast rates and aggregation by checking
+for the patched `mt7921e`, so the Realtek fell back to the legacy ladder (54 Mbit/s). The stock `rtw89` already
+honours injected HT and VHT rates, so the rate now depends on the driver family, not on one module. The card also
+has no "active monitor" mode; in borrow mode that does not matter, because the hidden access point carries the
+same address and the chip acknowledges for it.
+
+Fixing the rate was not enough: the speed stayed at 0.2 MB/s at every rate. Ruled out one by one: Bluetooth
+coexistence (Wi-Fi owns the antenna on 5 GHz), scans, power saving, mac80211's airtime limiter (AQL), and the
+chip's busy-channel check (EDCCA).
+
+Entry: "E-RTW89 Phase 0" (the earlier runs are listed in it).
+
+### 15. The chip holds frames for a peer it has no station entry for
+
+On air, the card sent exactly 17 frames, the iPhone acknowledged them within 2 ms, then nothing for about 140 ms,
+seven times a second. A frame waited a median 424 ms between mac80211 and its status, mac80211's own queues were
+empty, and the chip's DMA indexes showed it had fetched every frame. Injected frames to a peer without a station
+entry go out under the access point's own entry (`rtw89_core_tx_get_mac_id`), and the chip serves that entry in
+bursts. With the iPhone registered as a station of the access point (OWL `-g`: station entry, no Block Ack request,
+OWL's rate kept), the same send ran at 5.5 MB/s (MCS 15 / 40 MHz throughout, nothing lost) and receive went from
+0.56 to 20.5 MB/s; the iPhone's retries to us fell from 58 % to 10 %. This is now the default for every rtw89
+session, stock driver included.
+
+Entry: "E-RTW89 Phase 0". Repeat: `AIRDROP_HELPER_ARGS=--tx-sta` against a build without the rtw89 default.
+
+### 16. Aggregation on rtw89: 5.5 → 40.5 MB/s
+
+The MT7921 recipe (finding 7) carries over as a patch to `rtw89_core` (`driver/rtw89-awdl.diff`, module
+parameter `awdl_ba`): an AWDL-format ADDBA response from a station switches the firmware's aggregation on, and
+injected frames no longer make the driver start mac80211's own Block Ack session (the trace with the station
+entry had six such requests, each one stopping the queue for up to a second). 417 MB went out in 10.3 s at
+VHT MCS 9, 80 MHz, two streams, without a single retry; receive reached 25.2 MB/s. That is faster than the MT7921
+in both directions.
+
+Entry: "E-RTW89 F1". Repeat: `scripts/rtw89-build.sh`, `scripts/rtw89-load.sh load`, `airdrop send`.
 
 ## What is not here
 

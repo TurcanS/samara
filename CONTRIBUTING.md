@@ -2,20 +2,22 @@
 
 ## Hardware reports
 
-This has run on one laptop and one phone, so a report from other hardware is the most useful thing you can send,
-whether it worked or not. Please include:
+This has run on two cards (MediaTek MT7921, Realtek RTL8852BE) and one phone, so a report from other hardware
+is the most useful thing you can send, whether it worked or not. If it works but is slow,
+[Faster on your card](docs/wiki/Faster-on-your-card.md) shows how to find out why. Please include:
 
 - the Wi-Fi card (`lspci -nn` or `lsusb` line) and kernel version (`uname -r`, without a host name);
 - the output of `airdrop doctor`;
 - the Apple device model and OS version, and whether it was joined to Wi-Fi (2.4 or 5 GHz);
 - what you ran, what you expected, and the last 30 lines of `/run/airdrop-helper.log` and `/run/airdrop-owl.log`.
+- for a slow transfer: the text output of `scripts/air-check.py` on a trace of it (addresses replaced).
 
 ## Never attach raw captures
 
 A session folder from `scripts/airdrop-trace.sh` holds packet captures and request dumps. They contain MAC
 addresses, device and network names, Bluetooth contact hashes (short hashes of a phone number and email
 addresses) and Apple-signed identity records, yours and those of anyone nearby. Do not upload them. Send the
-text output of `scripts/analyze-trace.py` instead, and replace addresses and names.
+text output of `scripts/analyze-trace.py` and `scripts/air-check.py` instead, and replace addresses and names.
 
 ## Scope
 

@@ -94,15 +94,21 @@ whatever the others did.
 | `mount -t debugfs`, `umount` | reach the mt76 knobs | mount(2) / umount(2) |
 | OWL binary | AWDL | same; flags below |
 
-Files read: `/sys/class/net/*`, `/sys/module/mt7921e/srcversion`, `/run/airdrop-mt7921-ht`,
+Files read: `/sys/class/net/*` (incl. `device/driver`, which picks the driver family in `driver.rs`),
+`/sys/module/mt7921e/srcversion`, `/run/airdrop-mt7921-ht`, `/sys/module/{mt7921e,rtw89_core}/parameters/awdl_ba`,
 `/sys/kernel/debug/ieee80211/<phy>/mt76/{runtime-pm,deep-sleep}`, the OWL binary (for its usage strings).
 
 ## 4. OWL command line (borrow mode on 5 GHz, all defaults)
 
-`owl -i awdlact -c 149 -N -P 10000 -I -S -H -V -R -C 149 -r auto-ht|auto -A -p 16 [-G awdlgo]`
+`owl -i awdlact -c 149 -N -P 10000 -I -S -H -V -R -C 149 -r auto-ht|auto -A -p 16 [-G awdlgo | -g awdlgo]`
 
-`-G awdlgo` with `--tx-agg` (what the client passes for `send` since API 11) when the loaded mt7921e has the
-`awdl_ba` parameter.
+`-G awdlgo` with `--tx-agg` (what the client passes for `send` since API 11) when the loaded driver build has the
+`awdl_ba` parameter (mt7921e, or our rtw89 build). On rtw89 (`driver.rs` `Family::needs_station`) every borrow
+session registers its peers as stations without the client asking: `-G awdlgo` with our build (`awdl_ba` on for the
+session), else `-g awdlgo` (stations, no Block Ack request, OWL's rate kept; the stock rtw89 holds injected frames
+to a peer without a station entry). Hidden `--tx-sta` forces `-g` on any driver. rtw89 has no active monitor, so
+OWL runs on `awdlmon` there; the GO's address makes the chip acknowledge. The automatic rate is `auto-ht` on every
+driver except an mt7921e without our HT build.
 
 Each optional flag is added only when the installed OWL has its usage string. `-F` `--static-seq`, `-M` `--election-metric`,
 `-v`; `-V` only while the GO runs at 80 MHz (API 10 default on 149-161; `--ht40` drops it and makes the GO 40 MHz);
@@ -112,8 +118,9 @@ plus the rate on 5 GHz.
 
 **`--tx-agg` (aggregated sending, API 11; the client passes it for `send` in borrow mode).** The helper
 - starts the GO with a beacon tail (`radio::beacon_tail`: HT/VHT Capabilities and Operation),
-- writes `1` to `/sys/module/mt7921e/parameters/awdl_ba` (old value kept in the state file's `pm` map and restored
-  like the power-saving knobs; `recover` writes `0` whenever the parameter exists),
+- writes `1` to the build's `awdl_ba` (`/sys/module/mt7921e/parameters/awdl_ba` or
+  `/sys/module/rtw89_core/parameters/awdl_ba`; old value kept in the state file's `pm` map and restored like the
+  power-saving knobs; `recover` writes `0` whenever the parameter exists),
 - adds `-G awdlgo` to OWL,
 - at teardown logs `iw dev awdlgo station dump` and each station's `ht_capa`, `vht_capa`, `agg_status` from debugfs.
 
@@ -136,4 +143,5 @@ The level is reported in `up` (`api`); the client warns when it is lower than it
 | 9 | 2026-11-14 | Short bring-up by default: in borrow mode the scan guard starts right after Wi-Fi is paused, the settle wait is 500 ms (as `--fast` was), the GO start retries, no frame check (`--fast` is accepted, no longer needed; hidden `--careful` restores API 8's sequence). BLE advert before `resolvectl`. Reconnect tries the access point Wi-Fi was on (`nm_disconnected.ap`). `timing:` lines in the log |
 | 10 | 2026-11-14 | Borrow on 149-161: the GO at **80 MHz** and OWL `-V` (VHT caps) by default (E-VHT80: 14.8 → 21.0 MB/s); 40 MHz fallback if 80 MHz is refused; `-V` only when nl80211 reports 80 MHz. Hidden `--ht40` = API 9; `--vht80` adds 36-48. Reconnect activates the paused connection before device auto-connect goes back on; 50 ms state polling |
 | 11 | 2026-11-16 | `--tx-agg` (the client passes it for `send` in borrow mode): OWL `-G awdlgo`, driver `awdl_ba` on for the session, full GO beacon; 5.4 → 30.6 MB/s on 417 MB. Used only with the mt7921e build that has the parameter and an OWL with `-G`; otherwise single frames as in API 10 |
+| 11 (same number) | 2026-11-22 | Realtek rtw89: stations for every borrow session (`-g`, or `-G` + `awdl_ba` with our build); `auto-ht` on every driver but a non-HT mt7921e. The helper decides from the driver; the client is unchanged. Send 0.2 → 5.5 (stock) → 40.5 MB/s (build), receive 0.56 → 20.5 → 25.2 MB/s |
 | 11 (same number) | 2026-11-16 | Borrow mode also accepts channel **36** (an iPhone joined to a network on 36 mostly does not answer on 149; EXPERIMENTS C-2); `prefer` message |

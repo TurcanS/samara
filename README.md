@@ -16,13 +16,15 @@ airdrop doctor                        # check hardware, OWL, polkit, Bluetooth, 
 airdrop recover                       # undo a crashed session, give Wi-Fi back
 ```
 
-| Direction | Speed | Run |
+| Card | iPhone → Linux | Linux → iPhone |
 |---|---|---|
-| iPhone → Linux | **21 MB/s** | 150.9 MB, 25 items, in 7.2 s |
-| Linux → iPhone | **30.6 MB/s** | 417 MB in 13.6 s |
+| Realtek RTL8852BE (`rtw89`), our driver build | **25.2 MB/s** (417 MB in 16.5 s) | **40.5 MB/s** (417 MB in 10.3 s) |
+| MediaTek MT7921 (`mt7921e`), our driver build | **21 MB/s** (150.9 MB, 25 items, in 7.2 s) | **30.6 MB/s** (417 MB in 13.6 s) |
+| Realtek RTL8852BE, stock driver | 20.5 MB/s | 5.5 MB/s |
 
-Measured with a MediaTek MT7921 and an iPhone 17 on iOS 27.2. How those numbers were reached, including the
-wrong turns, is in [`docs/FINDINGS.md`](docs/FINDINGS.md).
+Measured with an iPhone 17 on iOS 27.2. How those numbers were reached, including the wrong turns, is in
+[`docs/FINDINGS.md`](docs/FINDINGS.md). Each card has a page in the [wiki](docs/wiki/Home.md), and
+[Faster on your card](docs/wiki/Faster-on-your-card.md) shows how to find what holds another card back.
 
 A samara is the winged seed of a maple: a small thing that travels by air.
 
@@ -31,9 +33,17 @@ A samara is the winged seed of a maple: a small thing that travels by air.
 
 ## Status
 
-Tested on **one laptop and one phone**: Arch Linux, kernel 7.2.5, MediaTek MT7921 (`14c3:7961`), NetworkManager,
-BlueZ; iPhone 17, iOS 27.2. A few other iPhones nearby have sent and received along the way. Other cards, other
-distributions and Macs are untested. Reports are welcome, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Tested on **two laptops and one phone**, Arch Linux with NetworkManager and BlueZ, iPhone 17 on iOS 27.2:
+
+| Card | Driver | Kernel | Status |
+|---|---|---|---|
+| MediaTek MT7921 (`14c3:7961`) | `mt7921e` + [our patch](driver/README.md) | 7.2.5 | works, fast both ways ([wiki](docs/wiki/MediaTek-MT7921.md)) |
+| Realtek RTL8852BE (`10ec:b852`) | `rtw89_8852be` + [our patch](driver/README.md) | 7.3.5 | works, fastest so far ([wiki](docs/wiki/Realtek-RTL8852BE.md)) |
+| Realtek RTL8852BE | stock `rtw89_8852be` | 7.3.5 | works: receive 20.5 MB/s, send 5.5 MB/s |
+| MediaTek MT7921 | stock `mt7921e` | | does not work on 5 GHz: frames to one device go out at 1 Mbit/s CCK, which 5 GHz does not have |
+
+A few other iPhones nearby have sent and received along the way. Other cards, other distributions and Macs are
+untested; `airdrop doctor` names your driver, and reports are welcome, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 Known open issue: the iPhone lists us reliably only when `airdrop receive` is already running before its share
 sheet opens (finding 10). **Start `receive` first, then open the share sheet.** `airdrop listen` reacts about
@@ -100,6 +110,19 @@ scripts/mt7921-ratefix.sh load        # once per boot; Wi-Fi blips for ~3 s. `re
 
 Nothing is installed: the stock module on disk is untouched.
 
+### Realtek RTL8852BE: the driver patch
+
+The stock `rtw89` already works (the helper registers the iPhone as a station of its access point in every
+session), but sends single frames: 5.5 MB/s. The patch lets the firmware aggregate for AWDL peers: 40.5 MB/s.
+See [`driver/README.md`](driver/README.md).
+
+```sh
+scripts/rtw89-build.sh                # once per kernel version; fetches the kernel's rtw89 source
+scripts/rtw89-load.sh load            # once per boot; Wi-Fi blips for a few seconds. `revert` or a reboot undoes it
+```
+
+The five 8852BE modules are swapped together; nothing on disk changes.
+
 ### Arch package
 
 ```sh
@@ -159,6 +182,7 @@ airdrop config known add "Anna's iPhone"
 NAME=rx   DUR=120 scripts/airdrop-trace.sh --mode borrow
 NAME=send DUR=120 scripts/airdrop-trace.sh send --mode borrow -r "device name" FILE
 python3 -I scripts/analyze-trace.py probe/sessions/<dir>
+python3 -I scripts/air-check.py probe/sessions/<dir>      # what holds your card back, with the likely cause
 ```
 
 Each run writes `probe/sessions/<time>-NAME/` (logs, packet captures, protocol dumps) and needs sudo for the
@@ -172,7 +196,8 @@ repository, and they should stay out of issue reports too.
 | [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | the lab log: every run with its prediction, result and corrections |
 | [`docs/HELPER.md`](docs/HELPER.md) | the root helper's contract and flag history |
 | [`docs/RESEARCH.md`](docs/RESEARCH.md) | background and what other projects found |
-| [`driver/README.md`](driver/README.md) | the MT7921 driver patch |
+| [`driver/README.md`](driver/README.md) | the MT7921 and rtw89 driver patches |
+| [`docs/wiki/`](docs/wiki/Home.md) | one page per tested card, and how to make another card fast |
 
 ## Tests
 
@@ -201,6 +226,8 @@ once); stalls, cut-off transfers and Ctrl-C.
 - "N Apple devices in radio range but did not answer" when sending means the iPhone hears us but its AirDrop is
   not receiving: set **Everyone for 10 Minutes** again (it expires).
 - If devices don't show up, check `airdrop -v find`, then `/run/airdrop-owl.log` and `/run/airdrop-helper.log`.
+- Fast transfers need a driver that sends injected frames at the rate asked for and lets the firmware aggregate
+  for AWDL peers. Two cards are known to; for others see [Faster on your card](docs/wiki/Faster-on-your-card.md).
 
 ## Credits
 
