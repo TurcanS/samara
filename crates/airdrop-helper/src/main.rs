@@ -8,6 +8,7 @@
 
 mod args;
 mod ble;
+mod driver;
 mod genl;
 mod nl80211;
 mod nm;

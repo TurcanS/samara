@@ -14,6 +14,8 @@ pub const OWL_LOG: &str = "/run/airdrop-owl.log";
 /// iPhones leave our channel for 10-14 s at a time (measured): keep them as peers
 /// (and their neighbor entry) across such gaps.
 const PEER_TIMEOUT_MS: u32 = 10_000;
+/// The one driver whose stock build cannot send injected frames at HT rates.
+pub const MT7921_DRIVER: &str = "mt7921e";
 const HT_DRIVER_MARK: &str = "/run/airdrop-mt7921-ht";
 /// srcversion of the HT-capable mt7921e builds known by name (see driver/README.md). Add the value
 /// after rebuilding the module for another kernel, then reinstall the helper.
@@ -94,6 +96,8 @@ pub struct Settings {
     pub election_metric: Option<u32>,
     /// The access-point interface OWL registers peers on as stations (`-G`, E-TXAGG).
     pub sta_iface: Option<String>,
+    /// With `sta_iface`: stations without Block Ack (`-g`) instead of `-G`.
+    pub sta_no_ba: bool,
     pub ba_probe: bool,
     pub verbose: bool,
 }
@@ -104,14 +108,26 @@ fn tx_rate(owl: &Binary, s: &Settings) -> Option<String> {
     // and steps down while frames go unacknowledged, back up when they are. With the HT
     // driver build the ladder starts at MCS 15 / 40 MHz / short GI (43 MB at 5.6 MB/s),
     // otherwise at 54 Mbit/s (1.0 MB/s). Before that: 24 Mbit/s = 390 KB/s, 54 = 676 KB/s.
+    //
+    // Which ladder depends on the driver, not on the card being a MediaTek: only mt7921e
+    // needs our build to keep an injected HT rate (stock: 1 Mbit/s CCK, the rate-fixed
+    // build: legacy only). Every other driver gets the HT ladder. Drivers that honour
+    // radiotap rates (rtw89 since it gained injection support, ath9k, rt2800, iwlwifi
+    // for injected frames, mt76x2) then send at MCS 15 / 40 MHz instead of 54 Mbit/s,
+    // about five times faster; one that ignores the rate sends at its own rate either way,
+    // and one that mishandles HT loses frames and the ladder steps down to 24/12 Mbit/s.
     let mut rate = s.tx_rate.clone();
     if rate.is_none() && s.channel >= 36 {
+        let driver = sys::driver_of(&s.vif).unwrap_or_default();
+        let ht = if driver == MT7921_DRIVER { ht_driver_loaded() } else { true };
         rate = Some(if owl.has(b"auto / auto-ht") {
-            if ht_driver_loaded() { "auto-ht" } else { "auto" }
+            if ht { "auto-ht" } else { "auto" }
         } else {
             "54"
         }.to_string());
-        if s.borrow && stock_driver_loaded() {
+        log(&format!("tx rate: driver {}, ladder {}", if driver.is_empty() { "?" } else { &driver },
+                     rate.as_deref().unwrap_or("-")));
+        if s.borrow && driver == MT7921_DRIVER && stock_driver_loaded() {
             notice("the stock Wi-Fi driver is loaded: sending to an iPhone will be several times slower (see `airdrop doctor`)");
         }
     }
@@ -191,7 +207,13 @@ pub fn command_line(owl: &Binary, s: &Settings) -> Vec<String> {
     }
     flag(owl, &mut cmd, b"Block Ack probe: asking", "-B", s.ba_probe, s.ba_probe);
     if let Some(iface) = &s.sta_iface {
-        if owl.has(b"stations: peers we send to") {
+        if s.sta_no_ba {
+            if owl.has(b"stations without Block Ack") {
+                cmd.extend(["-g".into(), iface.clone()]);
+            } else {
+                warn("the installed OWL has no -g: rebuild and reinstall it (sending without a station entry)");
+            }
+        } else if owl.has(b"stations: peers we send to") {
             cmd.extend(["-G".into(), iface.clone()]);
         } else {
             warn("the installed OWL has no -G: rebuild and reinstall it (sending without aggregation)");

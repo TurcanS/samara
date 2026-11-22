@@ -434,9 +434,15 @@ impl<'a> Session<'a> {
                 Ok(ACT_IFACE)
             }
             Err(Stop::Interrupted) => Err(Stop::Interrupted),
+            Err(Stop::Failed(e)) if self.borrow => {
+                // Drivers without active monitor (rtw89, most non-mt76 ones): the hidden GO
+                // carries the same MAC, so the hardware acknowledges the iPhone's frames anyway.
+                log(&format!("no active monitor interface ({e}); the access point acknowledges for {MON_IFACE}"));
+                Ok(MON_IFACE)
+            }
             Err(Stop::Failed(e)) => {
                 warn(&format!("no active monitor interface ({e}); the iPhone's frames will not be \
-                               acknowledged, transfers will likely fail"));
+                               acknowledged, transfers will likely fail (borrow mode does not need it)"));
                 Ok(MON_IFACE)
             }
         }
@@ -456,7 +462,7 @@ impl<'a> Session<'a> {
             // A warning, not an error: a false alarm must not stop a session that works.
             warn(&format!("injection looks broken on kernel {kernel}: frames sent on {vif} (channel {channel}) are \
                            not leaving the driver, so the iPhone will not answer. Check `iw reg get` (No-IR) and \
-                           the kernel's mt76/mac80211 version"));
+                           the kernel's Wi-Fi driver and mac80211 version"));
         }
     }
 
@@ -464,7 +470,8 @@ impl<'a> Session<'a> {
     /// name the interface OWL registers them on. The old value goes into the state file with
     /// the power-saving knobs, so teardown and `recover` put it back. None (with one warning)
     /// when this session cannot do it; OWL then sends as before.
-    fn tx_agg(&mut self) -> Option<String> {
+    /// Returns the interface and whether OWL must not ask for Block Ack (`-g` instead of `-G`).
+    fn tx_agg(&mut self) -> Option<(String, bool)> {
         if !self.args.tx_agg {
             return None;
         }
@@ -474,7 +481,16 @@ impl<'a> Session<'a> {
         }
         if !owl::agg_driver_loaded() {
             // The client asks for it on every send (API 11): not having the build is normal.
-            log("tx-agg: the loaded mt7921e has no awdl_ba parameter (scripts/mt7921-ratefix.sh load); sending single frames");
+            let (family, driver) = crate::driver::Family::of(&self.args.iface);
+            if family.needs_station() {
+                log(&format!("tx-agg: {driver}: peers become stations of the access point, single frames without Block Ack"));
+                return Some((GO_IFACE.to_string(), true));
+            }
+            if driver == owl::MT7921_DRIVER {
+                log("tx-agg: the loaded mt7921e has no awdl_ba parameter (scripts/mt7921-ratefix.sh load); sending single frames");
+            } else {
+                log(&format!("tx-agg: aggregated sending needs the patched mt7921e; driver {driver} sends single frames"));
+            }
             return None;
         }
         let path = owl::AGG_DRIVER_PARAM.to_string();
@@ -500,13 +516,24 @@ impl<'a> Session<'a> {
                 None => warn("--tx-agg-bw: this driver build has no awdl_bw parameter; the firmware picks the width"),
             }
         }
-        Some(GO_IFACE.to_string())
+        Some((GO_IFACE.to_string(), false))
+    }
+
+    /// `--tx-sta`, and every borrow session on a driver that `needs_station()`: the GO's interface
+    /// for OWL's `-g`, or None (with a warning) outside borrow mode.
+    fn tx_sta(&self) -> Option<(String, bool)> {
+        if !self.borrow || !sys::iface_exists(GO_IFACE) {
+            warn("--tx-sta needs borrow mode (the stations live on its access-point interface)");
+            return None;
+        }
+        log("stations: peers become stations of the access point, without Block Ack (OWL -g)");
+        Some((GO_IFACE.to_string(), true))
     }
 
     /// What the stations looked like at the end of an E-TXAGG session, for the log: rates and
     /// retries as the firmware reports them, and mac80211's view of each Block Ack session.
     fn log_stations(&self) {
-        if !self.args.tx_agg || !sys::iface_exists(GO_IFACE) {
+        if !sys::iface_exists(GO_IFACE) {
             return;
         }
         if let Some((_, out)) = sys::run(sys::tool("iw"), &["dev", GO_IFACE, "station", "dump"]) {
@@ -547,7 +574,16 @@ impl<'a> Session<'a> {
             .ok_or_else(|| format!("OWL not found (expected root-owned binary in {})", sys::OWL_PATHS.join(", ")))?;
         let binary = io(owl::Binary::open(path))?;
         let a = self.args;
-        let sta_iface = self.tx_agg();
+        // rtw89 holds injected frames to a peer without a station entry: every borrow session
+        // registers its peers there (send 0.2 -> 5.5 MB/s, receive 0.56 -> 20.5 MB/s, 2026-11-22).
+        let (family, _) = crate::driver::Family::of(&a.iface);
+        let station = if a.tx_sta || (self.borrow && family.needs_station() && !owl::agg_driver_loaded()) {
+            self.tx_sta()
+        } else {
+            self.tx_agg()
+        };
+        let sta_no_ba = station.as_ref().is_some_and(|s| s.1);
+        let sta_iface = station.map(|s| s.0);
         let settings = owl::Settings {
             vif: vif.to_string(),
             channel,
@@ -565,6 +601,7 @@ impl<'a> Session<'a> {
             presence: a.presence,
             election_metric: a.election_metric,
             sta_iface,
+            sta_no_ba,
             ba_probe: a.ba_probe,
             verbose: a.verbose,
         };

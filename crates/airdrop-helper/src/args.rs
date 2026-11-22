@@ -120,6 +120,11 @@ pub struct Up {
     /// driver's `awdl_bw` parameter; without it the firmware decides (20 MHz on 2026-11-16).
     #[arg(long, hide = true, requires = "tx_agg", value_parser = clap::value_parser!(u32).range(1..=2), value_name = "1|2")]
     pub tx_agg_bw: Option<u32>,
+    /// Register peers as stations of the GO without asking them for Block Ack (OWL `-g`), so the
+    /// chip has an address entry for the iPhone while frames keep OWL's radiotap rate. Borrow mode
+    /// only. Automatic on rtw89 (driver.rs); this flag forces it on any driver (experiments).
+    #[arg(long, hide = true)]
+    pub tx_sta: bool,
     /// Experiment: OWL asks the peer for a Block Ack session itself (`-B`) and logs the answer.
     #[arg(long, hide = true)]
     pub ba_probe: bool,

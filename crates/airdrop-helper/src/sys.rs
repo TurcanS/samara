@@ -21,6 +21,13 @@ pub fn phy_of(iface: &str) -> Option<String> {
     Some(link.file_name()?.to_string_lossy().into_owned())
 }
 
+/// The kernel driver bound to an interface's device (`mt7921e`, `rtw89_8852be`, `iwlwifi`, ...).
+/// Monitor and GO interfaces share the device of the station interface.
+pub fn driver_of(iface: &str) -> Option<String> {
+    let link = fs::read_link(format!("/sys/class/net/{iface}/device/driver")).ok()?;
+    Some(link.file_name()?.to_string_lossy().into_owned())
+}
+
 pub fn phy_index(phy: &str) -> Option<u32> {
     phy.strip_prefix("phy")?.parse().ok()
 }
