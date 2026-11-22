@@ -22,10 +22,29 @@ const HT_DRIVER_MARK: &str = "/run/airdrop-mt7921-ht";
 const HT_DRIVER_SRCVERSIONS: [&str; 1] = ["199C7E82F589E3F103CBEC5"];
 /// Only the build with Block Ack for AWDL peers has this parameter (E-TXAGG); it is the HT
 /// build plus that, whatever its srcversion.
-pub const AGG_DRIVER_PARAM: &str = "/sys/module/mt7921e/parameters/awdl_ba";
+const AGG_DRIVER_PARAMS: [&str; 2] = [
+    "/sys/module/mt7921e/parameters/awdl_ba",
+    // Our rtw89 build (driver/rtw89-awdl.diff, 2026-11-22): the same semantics.
+    "/sys/module/rtw89_core/parameters/awdl_ba",
+];
+
+/// The `awdl_ba` parameter of the loaded driver build, if it has one.
+pub fn agg_param() -> Option<&'static str> {
+    AGG_DRIVER_PARAMS.into_iter().find(|p| std::path::Path::new(p).exists())
+}
 
 pub fn agg_driver_loaded() -> bool {
-    std::path::Path::new(AGG_DRIVER_PARAM).exists()
+    agg_param().is_some()
+}
+
+/// Only the mt7921e build has `awdl_bw` (refuted experiment, kept until its next rebuild).
+fn bw_param() -> Option<String> {
+    agg_param().map(|p| format!("{}/awdl_bw", p.rsplit_once('/').map_or("", |x| x.0)))
+        .filter(|p| std::path::Path::new(p).exists())
+}
+
+pub fn agg_bw_param() -> Option<String> {
+    bw_param()
 }
 
 /// The first root-owned, not group/world-writable OWL: root runs it.

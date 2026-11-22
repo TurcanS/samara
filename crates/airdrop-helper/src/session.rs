@@ -231,10 +231,9 @@ pub fn recover(iface: &str) {
             d.pm.entry(format!("{dir}/{knob}")).or_insert(1);
         }
     }
-    if owl::agg_driver_loaded() {
-        d.pm.entry(owl::AGG_DRIVER_PARAM.to_string()).or_insert(0); // E-TXAGG: off outside a session
-        let bw = format!("{}/awdl_bw", owl::AGG_DRIVER_PARAM.rsplit_once('/').map_or("", |p| p.0));
-        if std::path::Path::new(&bw).exists() {
+    if let Some(param) = owl::agg_param() {
+        d.pm.entry(param.to_string()).or_insert(0); // E-TXAGG: off outside a session
+        if let Some(bw) = owl::agg_bw_param() {
             d.pm.entry(bw).or_insert(0);
         }
     }
@@ -471,8 +470,10 @@ impl<'a> Session<'a> {
     /// the power-saving knobs, so teardown and `recover` put it back. None (with one warning)
     /// when this session cannot do it; OWL then sends as before.
     /// Returns the interface and whether OWL must not ask for Block Ack (`-g` instead of `-G`).
-    fn tx_agg(&mut self) -> Option<(String, bool)> {
-        if !self.args.tx_agg {
+    /// `always`: without the client asking (`--tx-agg`), for drivers that need the station entry and
+    /// the parameter in every session (rtw89: injected frames must not start mac80211's own session).
+    fn tx_agg(&mut self, always: bool) -> Option<(String, bool)> {
+        if !self.args.tx_agg && !always {
             return None;
         }
         if !self.borrow || !sys::iface_exists(GO_IFACE) {
@@ -493,7 +494,7 @@ impl<'a> Session<'a> {
             }
             return None;
         }
-        let path = owl::AGG_DRIVER_PARAM.to_string();
+        let path = owl::agg_param().map(str::to_string)?;
         let old = std::fs::read_to_string(&path).is_ok_and(|v| matches!(v.trim(), "Y" | "y" | "1"));
         if let Err(e) = sys::write_str(&path, "1") {
             warn(&format!("--tx-agg: cannot switch {path} on ({e}); sending without aggregation"));
@@ -503,7 +504,7 @@ impl<'a> Session<'a> {
             s.pm.entry(path).or_insert(i64::from(old));
         });
         if let Some(bw) = self.args.tx_agg_bw {
-            let path = format!("{}/awdl_bw", owl::AGG_DRIVER_PARAM.rsplit_once('/').map_or("", |p| p.0));
+            let path = owl::agg_bw_param().unwrap_or_default();
             match sys::read_int(&path) {
                 Some(old) => {
                     self.record(|s| {
@@ -576,11 +577,13 @@ impl<'a> Session<'a> {
         let a = self.args;
         // rtw89 holds injected frames to a peer without a station entry: every borrow session
         // registers its peers there (send 0.2 -> 5.5 MB/s, receive 0.56 -> 20.5 MB/s, 2026-11-22).
+        // With our rtw89 build (`awdl_ba`), every borrow session uses the aggregating path (send
+        // and receive alike: the parameter also stops mac80211's own Block Ack attempts).
         let (family, _) = crate::driver::Family::of(&a.iface);
         let station = if a.tx_sta || (self.borrow && family.needs_station() && !owl::agg_driver_loaded()) {
             self.tx_sta()
         } else {
-            self.tx_agg()
+            self.tx_agg(self.borrow && family.needs_station())
         };
         let sta_no_ba = station.as_ref().is_some_and(|s| s.1);
         let sta_iface = station.map(|s| s.0);
@@ -793,7 +796,10 @@ impl<'a> Session<'a> {
         self.record(|s| s.go = true);
         let quick = self.quick();
         let vht80 = !self.args.ht40 && (self.args.vht80 || (149..=161).contains(&channel));
-        let (mac, wide80) = radio::start_go(&mut self.nl, wiphy, channel, self.args.narrow, vht80, quick, self.args.tx_agg && owl::agg_driver_loaded())?;
+        // HT/VHT elements in the GO beacon: the firmware sends to stations at 20 MHz without them.
+        let full_beacon = owl::agg_driver_loaded()
+            && (self.args.tx_agg || crate::driver::Family::of(&self.args.iface).0.needs_station());
+        let (mac, wide80) = radio::start_go(&mut self.nl, wiphy, channel, self.args.narrow, vht80, quick, full_beacon)?;
         self.vht80 = wide80;
         self.record(|s| s.go_mac = Some(radio::mac_string(&mac)));
         self.timing.mark("access point up");
