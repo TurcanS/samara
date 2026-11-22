@@ -1,5 +1,5 @@
 diff --git a/daemon/core.c b/daemon/core.c
-index 8b17ede..cb55937 100644
+index 8b17ede..e390090 100644
 --- a/daemon/core.c
 +++ b/daemon/core.c
 @@ -70,7 +70,11 @@ void wlan_device_ready(struct ev_loop *loop, ev_io *handle, int revents) {
@@ -106,7 +106,7 @@ index 8b17ede..cb55937 100644
 +#define AWDL_BA_WAIT_US 50000
 +#define AWDL_BA_BULK_LEN 1000
 +static double awdl_station_block_ack(struct daemon_state *state, struct awdl_peer *peer, uint64_t now) {
-+	if (!peer->is_sta || peer->ba_granted)
++	if (!peer->is_sta || peer->ba_granted || state->io.sta_no_ba)
 +		return 0;
 +	if (peer->ba_wait_until > now)
 +		return usec_to_sec(peer->ba_wait_until - now);
@@ -407,16 +407,17 @@ index 03fd7a9..010c186 100644
  		log_error("unable to inject packet (%s)", pcap_geterr(state->wlan_handle));
  		return err;
 diff --git a/daemon/io.h b/daemon/io.h
-index 1deb21a..d6d69ac 100644
+index 1deb21a..db62b25 100644
 --- a/daemon/io.h
 +++ b/daemon/io.h
-@@ -43,6 +43,9 @@ struct io_state {
+@@ -43,6 +43,10 @@ struct io_state {
  	char *dumpfile;
  	char wlan_no_monitor_mode;
  	int wlan_is_file;
 +	int sta_ifindex;      /* -G: access-point interface that holds peers as stations (0 = off) */
 +	int sta_count;        /* stations registered right now */
 +	int sta_last_aid;     /* last association ID handed out (each station gets its own) */
++	int sta_no_ba;        /* -g: stations, but never ask for Block Ack (frames keep OWL's own rate) */
  };
  
  int io_state_init(struct io_state *state, const char *wlan, const char *host, const struct ether_addr *bssid_filter);
@@ -555,7 +556,7 @@ index b800c87..32520af 100644
  
  int neighbor_remove_rfc4291(int ifindex, const struct ether_addr *);
 diff --git a/daemon/owl.c b/daemon/owl.c
-index 6136d39..4d9d657 100644
+index 6136d39..81898ed 100644
 --- a/daemon/owl.c
 +++ b/daemon/owl.c
 @@ -20,6 +20,8 @@
@@ -567,7 +568,7 @@ index 6136d39..4d9d657 100644
  #include <signal.h>
  #include <syslog.h>
  #include <errno.h>
-@@ -91,15 +93,28 @@ int main(int argc, char *argv[]) {
+@@ -91,15 +93,29 @@ int main(int argc, char *argv[]) {
  	int log_level = LOG_INFO;
  	int filter_rssi = 1;
  	int no_monitor_mode = 0;
@@ -587,17 +588,18 @@ index 6136d39..4d9d657 100644
  	char wlan[PATH_MAX] = "";
  	char host[IFNAMSIZ] = DEFAULT_AWDL_DEVICE;
 +	char sta_iface[IFNAMSIZ] = "";
++	int sta_no_ba = 0;
  
  	struct ev_loop *loop;
  
  	struct daemon_state state;
  
 -	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fN")) != -1) {
-+	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNFIP:M:SC:HVRr:Ap:G:B")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNFIP:M:SC:HVRr:Ap:G:g:B")) != -1) {
  		switch (c) {
  			case 'D':
  				daemon = 1;
-@@ -126,6 +141,122 @@ int main(int argc, char *argv[]) {
+@@ -126,6 +142,129 @@ int main(int argc, char *argv[]) {
  			case 'N':
  				no_monitor_mode = 1;
  				break;
@@ -717,10 +719,17 @@ index 6136d39..4d9d657 100644
 +				 * mac80211 run Block Ack with AWDL peers (mt7921e awdl_ba=1). */
 +				snprintf(sta_iface, sizeof(sta_iface), "%s", optarg);
 +				break;
++			case 'g':
++				/* Like -G, but never ask for Block Ack: the peer gets a station entry (its own
++				 * address entry in the chip) while frames keep OWL's radiotap rate. For drivers
++				 * without the awdl_ba patch, e.g. rtw89 (2026-11-22). */
++				snprintf(sta_iface, sizeof(sta_iface), "%s", optarg);
++				sta_no_ba = 1;
++				break;
  			case '?':
  				if (optopt == 'i')
  					fprintf(stderr, "Option -%c needs to specify a wireless interface.\n", optopt);
-@@ -170,6 +301,9 @@ int main(int argc, char *argv[]) {
+@@ -170,6 +309,9 @@ int main(int argc, char *argv[]) {
  		case 6:
  			chan = CHAN_OPCLASS_6;
  			break;
@@ -730,7 +739,7 @@ index 6136d39..4d9d657 100644
  		case 44:
  			chan = CHAN_OPCLASS_44;
  			break;
-@@ -177,7 +311,7 @@ int main(int argc, char *argv[]) {
+@@ -177,7 +319,7 @@ int main(int argc, char *argv[]) {
  			chan = CHAN_OPCLASS_149;
  			break;
  		default:
@@ -739,7 +748,7 @@ index 6136d39..4d9d657 100644
  			return EXIT_FAILURE;
  	}
  
-@@ -193,6 +327,58 @@ int main(int argc, char *argv[]) {
+@@ -193,6 +335,60 @@ int main(int argc, char *argv[]) {
  		return EXIT_FAILURE;
  	}
  	state.awdl_state.filter_rssi = filter_rssi;
@@ -786,10 +795,12 @@ index 6136d39..4d9d657 100644
 +	state.io.sta_ifindex = 0;
 +	state.io.sta_count = 0;
 +	state.io.sta_last_aid = 0;
++	state.io.sta_no_ba = sta_no_ba;
 +	if (*sta_iface) {
 +		state.io.sta_ifindex = (int) if_nametoindex(sta_iface);
 +		if (state.io.sta_ifindex)
-+			log_info("stations: peers we send to are registered on %s", sta_iface);
++			log_info(sta_no_ba ? "stations without Block Ack: peers we send to are registered on %s"
++			                   : "stations: peers we send to are registered on %s", sta_iface);
 +		else
 +			log_warn("stations: no interface %s, sending single frames", sta_iface);
 +	}
