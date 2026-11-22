@@ -1,0 +1,233 @@
+diff --git a/drivers/net/wireless/realtek/rtw89/core.c b/drivers/net/wireless/realtek/rtw89/core.c
+index 397ebbfca..51a82cae0 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -26,6 +26,12 @@ static bool rtw89_disable_ps_mode;
+ module_param_named(disable_ps_mode, rtw89_disable_ps_mode, bool, 0644);
+ MODULE_PARM_DESC(disable_ps_mode, "Set Y to disable low power mode");
+ 
++static bool rtw89_awdl_ba;
++module_param_named(awdl_ba, rtw89_awdl_ba, bool, 0644);
++MODULE_PARM_DESC(awdl_ba, "AirDrop/AWDL: firmware aggregation towards stations that accept a Block Ack request in AWDL's frame format; injected frames never start mac80211's own session (default N)");
++
++static const u8 rtw89_awdl_bssid[ETH_ALEN] = {0x00, 0x25, 0x00, 0xff, 0x94, 0x73};
++
+ #define RTW89_DEF_CHAN(_freq, _hw_val, _flags, _band)	\
+ 	{ .center_freq = _freq, .hw_value = _hw_val, .flags = _flags, .band = _band, }
+ #define RTW89_DEF_CHAN_2G(_freq, _hw_val)	\
+@@ -1322,7 +1328,12 @@ rtw89_core_tx_update_desc_info(struct rtw89_dev *rtwdev,
+ 		break;
+ 	}
+ 
+-	if (unlikely(info->flags & IEEE80211_TX_CTL_INJECTED))
++	/* awdl_ba: an injected frame without a radiotap rate (aggregated QoS data to an AWDL
++	 * station) keeps the firmware's rate control instead of an invalid fixed rate.
++	 */
++	if (unlikely(info->flags & IEEE80211_TX_CTL_INJECTED) &&
++	    (!READ_ONCE(rtw89_awdl_ba) ||
++	     (info->control.flags & IEEE80211_TX_CTRL_RATE_INJECT)))
+ 		rtw89_core_tx_update_injection(rtwdev, tx_req, info);
+ }
+ 
+@@ -4006,6 +4017,116 @@ static bool rtw89_core_skb_pn_valid(struct rtw89_dev *rtwdev,
+ 	return true;
+ }
+ 
++static void rtw89_awdl_ba_work(struct wiphy *wiphy, struct wiphy_work *work)
++{
++	struct rtw89_dev *rtwdev = container_of(work, struct rtw89_dev, awdl_ba.work);
++	struct rtw89_awdl_ba_req req[RTW89_AWDL_BA_SLOTS];
++	unsigned int n, i;
++
++	lockdep_assert_wiphy(wiphy);
++
++	spin_lock_bh(&rtwdev->awdl_ba.lock);
++	n = rtwdev->awdl_ba.n;
++	memcpy(req, rtwdev->awdl_ba.req, n * sizeof(req[0]));
++	rtwdev->awdl_ba.n = 0;
++	spin_unlock_bh(&rtwdev->awdl_ba.lock);
++
++	for (i = 0; i < n; i++) {
++		struct ieee80211_sta *sta;
++		struct rtw89_sta *rtwsta;
++		struct rtw89_txq *rtwtxq;
++		u8 tid = req[i].tid;
++
++		/* The wiphy lock keeps the station alive after the RCU section. */
++		rcu_read_lock();
++		sta = ieee80211_find_sta_by_ifaddr(rtwdev->hw, req[i].peer, req[i].own);
++		rcu_read_unlock();
++		if (!sta || !sta->txq[tid])
++			continue;
++
++		rtwsta = sta_to_rtwsta(sta);
++		rtwtxq = (struct rtw89_txq *)sta->txq[tid]->drv_priv;
++		if (req[i].enable) {
++			if (test_bit(tid, rtwsta->ampdu_map) &&
++			    rtwsta->ampdu_params[tid].agg_num == req[i].buf_size)
++				continue;
++			rtwsta->ampdu_params[tid].agg_num = req[i].buf_size;
++			rtwsta->ampdu_params[tid].amsdu = false;
++			set_bit(tid, rtwsta->ampdu_map);
++			set_bit(RTW89_TXQ_F_AMPDU, &rtwtxq->flags);
++		} else {
++			if (!test_bit(tid, rtwsta->ampdu_map))
++				continue;
++			clear_bit(RTW89_TXQ_F_AMPDU, &rtwtxq->flags);
++			clear_bit(tid, rtwsta->ampdu_map);
++		}
++		rtw89_leave_ps_mode(rtwdev);
++		rtw89_chip_h2c_ampdu_cmac_tbl(rtwdev, rtwsta->rtwvif, rtwsta);
++		rtw89_phy_ra_recalc_agg_limit(rtwdev);
++		rtw89_info(rtwdev, "awdl_ba: %pM tid %u: aggregation %s (window %u)\n",
++			   sta->addr, tid, req[i].enable ? "on" : "off", req[i].buf_size);
++	}
++}
++
++/* awdl_ba: an ADDBA response (status 0) from an AWDL peer switches aggregation on for that
++ * station and TID; a DELBA from the recipient switches it off. Only frames with AWDL's BSSID.
++ */
++static void rtw89_awdl_ba_rx(struct rtw89_dev *rtwdev, struct sk_buff *skb)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
++	struct rtw89_awdl_ba_req *req;
++	u16 capab, params, buf_size = 0;
++	bool enable;
++	u8 tid;
++
++	if (skb->len < IEEE80211_MIN_ACTION_SIZE(action_code) ||
++	    !ieee80211_is_action(mgmt->frame_control) ||
++	    ieee80211_has_protected(mgmt->frame_control) ||
++	    is_multicast_ether_addr(mgmt->da) ||
++	    !ether_addr_equal(mgmt->bssid, rtw89_awdl_bssid) ||
++	    mgmt->u.action.category != WLAN_CATEGORY_BACK)
++		return;
++
++	switch (mgmt->u.action.action_code) {
++	case WLAN_ACTION_ADDBA_RESP:
++		if (skb->len < IEEE80211_MIN_ACTION_SIZE(addba_resp) ||
++		    le16_to_cpu(mgmt->u.action.addba_resp.status) != WLAN_STATUS_SUCCESS)
++			return;
++		capab = le16_to_cpu(mgmt->u.action.addba_resp.capab);
++		tid = u16_get_bits(capab, IEEE80211_ADDBA_PARAM_TID_MASK);
++		buf_size = u16_get_bits(capab, IEEE80211_ADDBA_PARAM_BUF_SIZE_MASK);
++		if (!buf_size || buf_size > 64)
++			buf_size = 64;
++		enable = true;
++		break;
++	case WLAN_ACTION_DELBA:
++		if (skb->len < IEEE80211_MIN_ACTION_SIZE(delba))
++			return;
++		params = le16_to_cpu(mgmt->u.action.delba.params);
++		if (params & IEEE80211_DELBA_PARAM_INITIATOR_MASK)
++			return; /* the peer ends its own session, not ours */
++		tid = u16_get_bits(params, IEEE80211_DELBA_PARAM_TID_MASK);
++		enable = false;
++		break;
++	default:
++		return;
++	}
++	if (tid >= IEEE80211_FIRST_TSPEC_TSID)
++		return;
++
++	spin_lock_bh(&rtwdev->awdl_ba.lock);
++	if (rtwdev->awdl_ba.n < RTW89_AWDL_BA_SLOTS) {
++		req = &rtwdev->awdl_ba.req[rtwdev->awdl_ba.n++];
++		ether_addr_copy(req->peer, mgmt->sa);
++		ether_addr_copy(req->own, mgmt->da);
++		req->tid = tid;
++		req->buf_size = buf_size;
++		req->enable = enable;
++	}
++	spin_unlock_bh(&rtwdev->awdl_ba.lock);
++	wiphy_work_queue(rtwdev->hw->wiphy, &rtwdev->awdl_ba.work);
++}
++
+ static void rtw89_core_rx_to_mac80211(struct rtw89_dev *rtwdev,
+ 				      struct rtw89_rx_phy_ppdu *phy_ppdu,
+ 				      struct rtw89_rx_desc_info *desc_info,
+@@ -4018,6 +4139,9 @@ static void rtw89_core_rx_to_mac80211(struct rtw89_dev *rtwdev,
+ 	if (unlikely(!napi_is_scheduled(napi)))
+ 		napi = NULL;
+ 
++	if (unlikely(READ_ONCE(rtw89_awdl_ba)))
++		rtw89_awdl_ba_rx(rtwdev, skb_ppdu);
++
+ 	rtw89_core_hw_to_sband_rate(rx_status);
+ 	rtw89_core_rx_stats(rtwdev, phy_ppdu, desc_info, skb_ppdu);
+ 	rtw89_core_update_rx_status_by_ppdu(rtwdev, rx_status, phy_ppdu);
+@@ -4716,6 +4840,17 @@ static void rtw89_core_txq_check_agg(struct rtw89_dev *rtwdev,
+ 	if (test_bit(RTW89_TXQ_F_FORBID_BA, &rtwtxq->flags))
+ 		return;
+ 
++	/* awdl_ba: frames injected to an AWDL peer never start mac80211's own session (the peer
++	 * does not answer it, and the queue stops for a second each time); they are aggregated
++	 * once the peer accepted OWL's request (rtw89_awdl_ba_work).
++	 */
++	if (READ_ONCE(rtw89_awdl_ba) &&
++	    (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_CTL_INJECTED)) {
++		if (test_bit(RTW89_TXQ_F_AMPDU, &rtwtxq->flags))
++			IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_AMPDU;
++		return;
++	}
++
+ 	if (unlikely(skb->protocol == cpu_to_be16(ETH_P_PAE))) {
+ 		rtw89_core_stop_tx_ba_session(rtwdev, rtwtxq);
+ 		return;
+@@ -6742,6 +6877,7 @@ void rtw89_core_stop(struct rtw89_dev *rtwdev)
+ 
+ 	wiphy_work_cancel(wiphy, &rtwdev->c2h_work);
+ 	wiphy_work_cancel(wiphy, &rtwdev->cancel_6ghz_probe_work);
++	wiphy_work_cancel(wiphy, &rtwdev->awdl_ba.work);
+ 	wiphy_work_cancel(wiphy, &btc->eapol_notify_work);
+ 	wiphy_work_cancel(wiphy, &btc->arp_notify_work);
+ 	wiphy_work_cancel(wiphy, &btc->dhcp_notify_work);
+@@ -6998,6 +7134,8 @@ int rtw89_core_init(struct rtw89_dev *rtwdev)
+ 	if (!rtwdev->txq_wq)
+ 		return -ENOMEM;
+ 	spin_lock_init(&rtwdev->ba_lock);
++	spin_lock_init(&rtwdev->awdl_ba.lock);
++	wiphy_work_init(&rtwdev->awdl_ba.work, rtw89_awdl_ba_work);
+ 	spin_lock_init(&rtwdev->rpwm_lock);
+ 	rtwdev->total_sta_assoc = 0;
+ 
+diff --git a/drivers/net/wireless/realtek/rtw89/core.h b/drivers/net/wireless/realtek/rtw89/core.h
+index 2b21d969e..f700a5685 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -7548,6 +7548,27 @@ struct rtw89_io_ops {
+ 			 u32 addr, u32 mask, u32 data);
+ };
+ 
++/* AirDrop/AWDL (module parameter awdl_ba): Block Ack answers from AWDL peers, seen on RX and
++ * applied in a wiphy work item. user space (OWL) negotiates the session in AWDL's frame format,
++ * which mac80211 neither sends nor accepts; the driver only watches for the peer's answer.
++ */
++#define RTW89_AWDL_BA_SLOTS 8
++
++struct rtw89_awdl_ba_req {
++	u8 peer[ETH_ALEN];
++	u8 own[ETH_ALEN];
++	u8 tid;
++	u8 buf_size;
++	bool enable;
++};
++
++struct rtw89_awdl_ba {
++	spinlock_t lock; /* protects req and n */
++	struct wiphy_work work;
++	struct rtw89_awdl_ba_req req[RTW89_AWDL_BA_SLOTS];
++	u8 n;
++};
++
+ struct rtw89_dev {
+ 	struct ieee80211_hw *hw;
+ 	struct device *dev;
+@@ -7591,6 +7612,7 @@ struct rtw89_dev {
+ 	/* txqs to forbid ba session */
+ 	struct list_head forbid_ba_list;
+ 	struct work_struct ba_work;
++	struct rtw89_awdl_ba awdl_ba;
+ 	/* used to protect rpwm */
+ 	spinlock_t rpwm_lock;
+ 
