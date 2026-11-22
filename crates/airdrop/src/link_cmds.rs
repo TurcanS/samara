@@ -762,7 +762,8 @@ pub fn doctor(cfg: &Config) -> i32 {
             row(Some(modes.contains("* monitor")), &format!("{iface} ({phy}) monitor mode"), "");
             let active = info.contains("supports active monitor");
             row(active.then_some(true), &format!("{iface} active monitor (ACKs unicast frames)"),
-                if active { "" } else { "not supported by this driver: transfers may be slow or fail" });
+                if active { "" } else { "not supported by this driver: borrow mode does not need it (its access point \
+                    acknowledges for us); shared mode may be slow or fail" });
             let dev = run("iw", &["dev", iface, "info"]);
             let chans = run("iw", &["phy", &phy, "channels"]);
             let country = run("iw", &["reg", "get"]).split("country ").nth(1).and_then(|r| r.split(':').next()).unwrap_or("?").to_string();
@@ -789,7 +790,25 @@ pub fn doctor(cfg: &Config) -> i32 {
                 _ => row(Some(false), "channel 149", "not usable for transmitting in the current regulatory domain (every AirDrop frame \
                     would be dropped silently). Fix: sudo iw reg set <your country, e.g. DE>"),
             }
-            row(None, "MediaTek tuning", "power saving is switched off while AirDrop runs (it silently stops monitor reception on mt76 cards)");
+            let driver = std::fs::read_link(format!("/sys/class/net/{iface}/device/driver")).ok()
+                .and_then(|l| l.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+            if Path::new(&format!("/sys/kernel/debug/ieee80211/{phy}/mt76")).exists() || driver.starts_with("mt7") {
+                row(None, "MediaTek tuning", "power saving is switched off while AirDrop runs (it silently stops monitor reception on mt76 cards)");
+            }
+            if driver.starts_with("rtw89_") && Path::new("/sys/module/rtw89_core/parameters/awdl_ba").exists() {
+                row(Some(true), &format!("{driver} driver"), "AirDrop build loaded (awdl_ba): the iPhone is a client of the \
+                    hidden access point, Block Ack in AWDL's format, firmware aggregation when sending (measured 40 MB/s \
+                    to an iPhone 17). Back to stock: <source folder>/scripts/rtw89-load.sh revert, or reboot");
+            } else if driver.starts_with("rtw89_") {
+                row(None, &format!("{driver} driver"), "stock driver: each session registers the iPhone as a client of the \
+                    hidden access point (measured with an iPhone 17: send 5.5 MB/s, single frames at HT rates; receive \
+                    20.5 MB/s); aggregated sending needs our rtw89 build: <source folder>/scripts/rtw89-build.sh, then \
+                    scripts/rtw89-load.sh load");
+            } else if driver != "mt7921e" && !driver.is_empty() {
+                row(None, &format!("{driver} driver"), "sending uses HT rates (MCS 15, 40 MHz) and steps down by itself when \
+                    the iPhone stops acknowledging; single frames, no aggregation. If transfers are slow, \
+                    docs/wiki/Faster-on-your-card.md shows how to find out why");
+            }
             if let Ok(now) = std::fs::read_to_string("/sys/module/mt7921e/srcversion").map(|s| s.trim().to_string()) {
                 let disk = run("modinfo", &["-F", "srcversion", "mt7921e"]).trim().to_string();
                 let ht = std::fs::read_to_string("/run/airdrop-mt7921-ht").is_ok_and(|s| s.trim() == now) || link::HT_DRIVER_SRCVERSIONS.contains(&now.as_str());
