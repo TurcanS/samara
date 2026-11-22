@@ -766,34 +766,55 @@ def test_iphone_closes_connection_on_ask_reads_as_declined_not_a_failure(homes, 
     srv = socket.create_server(("::1", 0), family=socket.AF_INET6)
     asks = []
 
-    def pump(a, b):
+    def relay(conn, up):
+        # One thread polling both ends: an SSL socket must not be read and written from two
+        # threads at once, and select() misses records OpenSSL has already pulled in.
+        import time
+        other = {conn: up, up: conn}
+        reading = [conn, up]
+        for s in reading:
+            s.settimeout(0.02)
+        deadline = time.monotonic() + 30
         try:
-            while d := a.recv(65536):
-                b.sendall(d)
+            while reading and time.monotonic() < deadline:
+                for s in list(reading):
+                    try:
+                        d = s.recv(65536)
+                    except (socket.timeout, ssl.SSLWantReadError):
+                        continue
+                    if d:
+                        other[s].sendall(d)
+                    else:
+                        reading.remove(s)
+                        other[s].shutdown(socket.SHUT_WR)  # pass the end on; the reply may still be coming
         except OSError:
             pass
-        for s in (a, b):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        finally:
+            for s in (conn, up):
+                s.close()
+
+    def handle(raw):
+        # One thread per connection: a sender with two connections open must not wait on the first.
+        try:
+            conn = sctx.wrap_socket(raw, server_side=True)
+            first = conn.recv(65536)
+        except OSError:
+            return
+        if b"/Ask" in first:
+            asks.append(1)
+            conn.close()  # no HTTP status at all
+            return
+        up = cctx.wrap_socket(socket.create_connection(("::1", rx.port)), server_hostname="x")
+        up.sendall(first)
+        relay(conn, up)
 
     def serve():
         while True:
             try:
                 raw, _ = srv.accept()
-                conn = sctx.wrap_socket(raw, server_side=True)
-                first = conn.recv(65536)
             except OSError:
                 return
-            if b"/Ask" in first:
-                asks.append(1)
-                conn.close()  # no HTTP status at all
-                continue
-            up = cctx.wrap_socket(socket.create_connection(("::1", rx.port)), server_hostname="x")
-            up.sendall(first)
-            threading.Thread(target=pump, args=(conn, up), daemon=True).start()
-            threading.Thread(target=pump, args=(up, conn), daemon=True).start()
+            threading.Thread(target=handle, args=(raw,), daemon=True).start()
 
     threading.Thread(target=serve, daemon=True).start()
     try:
@@ -861,3 +882,182 @@ def test_sender_stops_or_delays_the_upload_when_user_sets_experiment(homes, tmp_
     finally:
         _, err = rx.stop()
     assert "Traceback" not in err, err
+
+
+# ---- --json: what a desktop shell drives -----------------------------------------------
+
+import json  # noqa: E402
+import threading  # noqa: E402
+
+
+class JsonCli:
+    """`airdrop --json ...` with its events collected as they arrive and commands sent as
+    JSON lines, the way a desktop shell drives it."""
+
+    def __init__(self, home: Path, cli: list[str], *args: str, env: dict | None = None) -> None:
+        self.home = home
+        self.proc = subprocess.Popen(cli + ["--json", *args], env={**_env(home), **(env or {})}, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.events: list[dict] = []
+        self.bad: list[str] = []
+        self._lock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                self.bad.append(line)  # stdout must carry nothing but events
+                continue
+            with self._lock:
+                self.events.append(ev)
+
+    @property
+    def downloads(self) -> Path:
+        return self.home / "Downloads" / "AirDrop"
+
+    def send(self, **command) -> None:
+        self.proc.stdin.write(json.dumps(command) + "\n")
+        self.proc.stdin.flush()
+
+    def seen(self, event: str, **match) -> list[dict]:
+        with self._lock:
+            return [e for e in self.events if e["event"] == event and all(e.get(k) == v for k, v in match.items())]
+
+    def wait(self, event: str, timeout: float = 20, **match) -> dict:
+        assert _wait_for(lambda: self.seen(event, **match), timeout), \
+            f"no {event} {match}; got {self.events}; stderr so far unknown"
+        return self.seen(event, **match)[0]
+
+    def close(self) -> tuple[int, str]:
+        """Close stdin the way the shell going away does; the command must stop by itself."""
+        try:
+            self.proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        code = self.proc.wait(timeout=15)
+        return code, self.proc.stderr.read()
+
+
+def _json_receiver(home: Path, *extra: str) -> tuple[JsonCli, int]:
+    rx = JsonCli(home, CLI, "receive", "--no-link", "--port", "0", "--name", "Linux Box", *extra)
+    port = rx.wait("visible")["port"]
+    return rx, port
+
+
+def _json_sender(home: Path, port: int, **kw) -> tuple[JsonCli, dict]:
+    tx = JsonCli(home, SENDER_CLI, "send", "--peer", f"[::1]:{port}", "--name", "Test Mac", "-t", "30", **kw)
+    return tx, tx.wait("peer")
+
+
+def test_shell_sends_and_user_accepts_then_always_then_known_sender_goes_straight_in(homes, tree):
+    """The shell keeps one send session: it picks the receiver three times. The user accepts
+    the first, says always to the second; the third is not asked about at all."""
+    rhome, shome = homes
+    rx, port = _json_receiver(rhome, "--ask")
+    tx, peer = _json_sender(shome, port)
+    try:
+        assert peer["name"] == "Linux Box" and peer["available"] is True
+        tx.send(pick=peer["id"], paths=[str(tree / "movie.mp4")])
+        ask = rx.wait("ask")
+        assert ask["sender"] == "Test Mac" and ask["asking"] is True and ask["known"] is False
+        assert ask["files"] == [{"name": "movie.mp4", "uti": "public.mpeg-4", "size": 12 * 1024 * 1024 + 123, "dir": False}]
+        assert ask["total"] == 12 * 1024 * 1024 + 123 and ask["timeout"] == 60
+        rx.send(answer="accept", id=ask["id"])
+        sent = tx.wait("transfer", phase="done")
+        got = rx.wait("transfer", phase="done", id=ask["id"])
+        assert got["saved"] == [str(rx.downloads / "movie.mp4")] and got["bytes"] == 12 * 1024 * 1024 + 123
+        assert rx.seen("answered", id=ask["id"])[0]["by"] == "user"
+        done = [e["done"] for e in tx.seen("progress", id=sent["id"])]
+        assert done and done == sorted(done) and done[-1] == 12 * 1024 * 1024 + 123
+
+        tx.send(pick=peer["id"], paths=[str(tree / "Holiday Photos")])
+        assert _wait_for(lambda: len(rx.seen("ask")) == 2, 20)
+        ask2 = rx.seen("ask")[1]
+        assert ask2["files"][0]["dir"] is True
+        rx.send(answer="always", id=ask2["id"])
+        rx.wait("transfer", phase="done", id=ask2["id"])
+
+        tx.send(pick=peer["id"], url="https://example.com/a?b=1")
+        assert _wait_for(lambda: len(rx.seen("ask")) == 3, 20)
+        ask3 = rx.seen("ask")[2]
+        assert ask3["known"] is True and ask3["asking"] is False and ask3["urls"] == ["https://example.com/a?b=1"]
+        assert rx.wait("link", id=ask3["id"])["url"] == "https://example.com/a?b=1"
+        assert _wait_for(lambda: len(tx.seen("transfer", phase="done")) == 3, 20)
+        tx.send(done=True)
+        assert tx.proc.wait(timeout=15) == 0
+    finally:
+        tcode, terr = tx.close()
+        rcode, rerr = rx.close()
+    assert rcode == 130, rerr  # stdin closed = stopped, as with Ctrl-C
+    assert not rx.bad and not tx.bad, (rx.bad, tx.bad)
+    assert _same_tree(tree / "Holiday Photos", rx.downloads / "Holiday Photos")
+    assert "Traceback" not in rerr + terr
+
+
+def test_shell_user_declines_or_lets_the_question_time_out(homes, tree):
+    rhome, shome = homes
+    rx, port = _json_receiver(rhome, "--ask", "--ask-timeout", "2")
+    tx, peer = _json_sender(shome, port)
+    try:
+        tx.send(pick=peer["id"], paths=[str(tree / "movie.mp4")])
+        ask = rx.wait("ask")
+        rx.send(answer="decline", id=ask["id"])
+        assert tx.wait("transfer", phase="declined")["message"]
+        assert rx.seen("answered", id=ask["id"])[0]["decision"] == "decline"
+
+        tx.send(pick=peer["id"], paths=[str(tree / "movie.mp4")])
+        assert _wait_for(lambda: len(rx.seen("answered")) == 2, 20)
+        assert rx.seen("answered")[1] == {"event": "answered", "id": rx.seen("ask")[1]["id"], "by": "timeout", "decision": "decline"}
+        assert _wait_for(lambda: len(tx.seen("transfer", phase="declined")) == 2, 20)
+        # Answering after the timeout changes nothing.
+        rx.send(answer="accept", id=rx.seen("ask")[1]["id"])
+        time.sleep(0.5)
+    finally:
+        tx.close()
+        _, rerr = rx.close()
+    assert not rx.downloads.exists() or not any(rx.downloads.iterdir())
+    assert "Traceback" not in rerr
+
+
+def test_shell_cancels_a_send_mid_upload_and_receiver_keeps_nothing(homes, tmp_path):
+    rhome, shome = homes
+    big = tmp_path / "big.mov"
+    with open(big, "wb") as f:
+        f.truncate(3 * 1024 * 1024 * 1024)  # sparse: quick to make, long enough to cancel
+    rx, port = _json_receiver(rhome, "--accept-all")
+    tx, peer = _json_sender(shome, port)
+    try:
+        tx.send(pick=peer["id"], paths=[str(big)])
+        first = tx.wait("progress")
+        tx.send(cancel=first["id"])
+        assert tx.wait("transfer", phase="cancelled")["id"] == first["id"]
+        assert rx.wait("transfer", phase="failed")["message"]
+        # The session stays usable: the next pick still sends.
+        small = tmp_path / "note.txt"
+        small.write_text("still here\n")
+        tx.send(pick=peer["id"], paths=[str(small)])
+        tx.wait("transfer", phase="done")
+    finally:
+        tx.close()
+        rx.close()
+    assert [p.name for p in rx.downloads.iterdir()] == ["note.txt"]
+
+
+def test_shell_gets_clear_errors_for_bad_picks(homes, tmp_path):
+    rhome, shome = homes
+    rx, port = _json_receiver(rhome, "--accept-all")
+    tx, peer = _json_sender(shome, port)
+    try:
+        tx.send(pick=peer["id"], paths=["relative/path.txt"])
+        assert tx.wait("error", code="input")["message"]
+        tx.send(pick="fe80::dead%awdl0", paths=[str(tmp_path)])
+        assert _wait_for(lambda: len(tx.seen("error", code="input")) == 2)
+        tx.proc.stdin.write("not json\n")
+        tx.proc.stdin.flush()
+        assert _wait_for(lambda: len(tx.seen("error", code="input")) == 3)
+    finally:
+        code, err = tx.close()
+        rx.close()
+    assert code == 0 and not tx.bad, err
