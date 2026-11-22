@@ -1,5 +1,6 @@
 //! Deciding whether to accept an incoming AirDrop: always the same answer (the default),
-//! a question in this terminal, or an actionable desktop notification.
+//! a question in this terminal, an actionable desktop notification, or (`--json`) an `ask`
+//! event answered on stdin.
 
 use crate::util::clean;
 use airdrop_proto::wire::AskInfo;
@@ -33,7 +34,8 @@ pub fn describe(info: &AskInfo) -> String {
 
 /// Best-effort desktop notification; never blocks or fails anything.
 pub fn notify(summary: &str, body: &str) {
-    if !desktop::available() {
+    // With --json the program driving us shows its own; a notification would be a duplicate.
+    if crate::events::on() || !desktop::available() {
         return;
     }
     let (summary, body) = (summary.to_string(), body.to_string());
@@ -74,6 +76,8 @@ pub enum Prompter {
     Static(Decision),
     Terminal { timeout: Duration },
     Notification { timeout: Duration },
+    /// `--json`: an `ask` event, answered by `{"answer": ..., "id": N}` on stdin.
+    Stdin { timeout: Duration },
 }
 
 impl Prompter {
@@ -82,16 +86,47 @@ impl Prompter {
         !matches!(self, Self::Static(_))
     }
 
-    pub async fn ask(&self, info: &AskInfo) -> Decision {
+    /// Seconds a person has to answer (0 = nobody is asked).
+    pub fn timeout(&self) -> u64 {
         match self {
-            Self::Static(d) => *d,
-            Self::Terminal { timeout } => terminal(info, *timeout).await,
-            Self::Notification { timeout } => notification(info, *timeout).await,
+            Self::Static(_) => 0,
+            Self::Terminal { timeout } | Self::Notification { timeout } | Self::Stdin { timeout } => timeout.as_secs(),
+        }
+    }
+
+    /// The decision, and who made it: `user`, or `timeout` when nobody answered in time.
+    /// `announce` runs once the answer can be taken (it emits the `ask` event).
+    pub async fn ask(&self, info: &AskInfo, id: u64, announce: impl FnOnce()) -> (Decision, &'static str) {
+        match self {
+            Self::Static(d) => {
+                announce();
+                (*d, "auto")
+            }
+            Self::Terminal { timeout } => {
+                announce();
+                terminal(info, *timeout).await
+            }
+            Self::Notification { timeout } => {
+                announce();
+                notification(info, *timeout).await
+            }
+            Self::Stdin { timeout } => {
+                let answer = crate::events::expect_answer(id);
+                announce();
+                match tokio::time::timeout(*timeout, answer).await {
+                    Ok(Ok(d)) => (d, "user"),
+                    Ok(Err(_)) => (Decision::Decline, "user"), // stdin closed: we are stopping
+                    Err(_) => {
+                        crate::events::drop_question(id);
+                        (Decision::Decline, "timeout")
+                    }
+                }
+            }
         }
     }
 }
 
-async fn terminal(info: &AskInfo, timeout: Duration) -> Decision {
+async fn terminal(info: &AskInfo, timeout: Duration) -> (Decision, &'static str) {
     // One question at a time: the lock on the line source is held until it is answered.
     let mut lines = stdin_lines().lock().await;
     let name = clean(info.sender_label());
@@ -104,22 +139,22 @@ async fn terminal(info: &AskInfo, timeout: Duration) -> Decision {
         match tokio::time::timeout(timeout, lines.recv()).await {
             Err(_) => {
                 eprintln!("\nNo answer, declined.");
-                return Decision::Decline;
+                return (Decision::Decline, "timeout");
             }
-            Ok(None | Some(None)) => return Decision::Decline, // stdin closed
+            Ok(None | Some(None)) => return (Decision::Decline, "user"), // stdin closed
             Ok(Some(Some(line))) => match line.trim().to_lowercase().as_str() {
-                "y" | "yes" => return Decision::Accept,
-                "n" | "no" => return Decision::Decline,
-                "a" | "always" => return Decision::Always,
+                "y" | "yes" => return (Decision::Accept, "user"),
+                "n" | "no" => return (Decision::Decline, "user"),
+                "a" | "always" => return (Decision::Always, "user"),
                 _ => {} // Enter alone (or anything else) asks again
             },
         }
     }
 }
 
-async fn notification(info: &AskInfo, timeout: Duration) -> Decision {
+async fn notification(info: &AskInfo, timeout: Duration) -> (Decision, &'static str) {
     if !desktop::available() {
-        return Decision::Decline;
+        return (Decision::Decline, "timeout");
     }
     let summary = format!("AirDrop from {}", clean(info.sender_label()));
     let body = describe(info);
@@ -127,9 +162,10 @@ async fn notification(info: &AskInfo, timeout: Duration) -> Decision {
     let asking = tokio::task::spawn_blocking(move || desktop::ask(&summary, &body, timeout));
     let answer = tokio::time::timeout(timeout + Duration::from_secs(5), asking).await.ok().and_then(Result::ok).flatten();
     match answer.as_deref() {
-        Some("accept") => Decision::Accept,
-        Some("always") => Decision::Always,
-        _ => Decision::Decline,
+        Some("accept") => (Decision::Accept, "user"),
+        Some("always") => (Decision::Always, "user"),
+        Some(_) => (Decision::Decline, "user"),
+        None => (Decision::Decline, "timeout"),
     }
 }
 

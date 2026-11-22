@@ -38,11 +38,27 @@ impl From<HttpError> for ConnError {
     }
 }
 
+/// OpenSSL reports a peer that hangs up without close_notify (or resets mid-record) as an
+/// SSL error of kind `Other`, not as `UnexpectedEof`; it is still the peer closing.
+fn tls_hangup(e: &io::Error) -> bool {
+    use openssl::ssl::{Error, ErrorCode};
+    let Some(ssl) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) else { return false };
+    match ssl.code() {
+        ErrorCode::SYSCALL => ssl.io_error().is_none_or(|io| matches!(io.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof)),
+        ErrorCode::SSL => ssl.ssl_error().is_some_and(|st| st.errors().iter()
+            .any(|x| x.reason().is_some_and(|r| r.contains("unexpected eof")))),
+        ErrorCode::ZERO_RETURN => true,
+        _ => false,
+    }
+}
+
 impl From<io::Error> for ConnError {
     fn from(e: io::Error) -> Self {
         use io::ErrorKind::*;
         match e.kind() {
             ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected => Self::Closed,
+            _ if tls_hangup(&e) => Self::Closed,
             _ => Self::Io(e),
         }
     }
@@ -154,5 +170,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     pub async fn shutdown(&mut self) {
         let _ = tokio::time::timeout(Duration::from_secs(3), self.io.shutdown()).await;
+    }
+
+    /// Close after answering a peer that is still sending: shut our side, then read and
+    /// discard what it sends for up to `within`. Closing with unread bytes queued makes the
+    /// kernel send a reset, which can destroy the answer before the peer has read it.
+    pub async fn linger(&mut self, within: Duration) {
+        self.shutdown().await;
+        let _ = tokio::time::timeout(within, async {
+            loop {
+                self.buf.clear();
+                if !matches!(self.fill().await, Ok(true)) {
+                    break;
+                }
+            }
+        }).await;
     }
 }

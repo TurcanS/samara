@@ -103,11 +103,24 @@ impl Activity {
 }
 
 struct Grant {
+    /// Names the question and its transfer in `--json` events.
+    id: u64,
     info: AskInfo,
     expires: Instant,
     /// `None` while undecided, then the answer.
     decision: watch::Receiver<Option<bool>>,
     task: AbortHandle,
+}
+
+/// A question or an accepted request that ends without an upload (the sender asked again,
+/// or we stopped): the shell's card for it must go.
+fn abandoned(g: &Grant) {
+    g.task.abort();
+    crate::events::drop_question(g.id);
+    if *g.decision.borrow() != Some(false) {
+        crate::events::emit("transfer", serde_json::json!({ "id": g.id, "dir": "in", "phase": "cancelled",
+            "message": "The sender stopped before sending" }));
+    }
 }
 
 struct Inner {
@@ -163,7 +176,7 @@ impl Receiver {
             let _ = server.await;
         }
         for (_, g) in self.inner.grants.lock().expect("not poisoned").drain() {
-            g.task.abort();
+            abandoned(&g);
         }
     }
 }
@@ -340,17 +353,18 @@ async fn ask(inner: &Arc<Inner>, head: &Head, conn: &mut Conn<Stream>, ip: IpAdd
         d.request(&peer, "POST", "/Ask", headers_json(&head.headers), &body, Some(200), Some("early ask: 200 sent before the body was read"));
     }
     let Ok(info) = AskInfo::parse(&body) else { return Ok(false) };
+    let id = crate::events::next_id();
     let (tx, rx) = watch::channel(None);
     let task = {
         let (inner, info) = (inner.clone(), info.clone());
         tokio::spawn(async move {
-            let accepted = decide(&inner, &info).await;
+            let accepted = decide(&inner, &info, id).await;
             let _ = tx.send(Some(accepted));
         })
     };
-    let grant = Grant { info, expires: Instant::now() + GRANT_TTL, decision: rx.clone(), task: task.abort_handle() };
+    let grant = Grant { id, info, expires: Instant::now() + GRANT_TTL, decision: rx.clone(), task: task.abort_handle() };
     if let Some(old) = inner.grants.lock().expect("not poisoned").insert(ip, grant) {
-        old.task.abort();
+        abandoned(&old);
     }
     if crate::is_verbose() {
         let inner = inner.clone();
@@ -393,16 +407,48 @@ fn tcp_state(fd: i32) -> String {
         f[4], f[23], f64::from(f[12]) / 1000.0, f64::from(f[11]) / 1000.0)
 }
 
-async fn decide(inner: &Inner, info: &AskInfo) -> bool {
+/// The `ask` event: who sends what, and whether someone has to answer.
+fn ask_event(info: &AskInfo, id: u64, known: bool, asking: bool, timeout: u64) {
+    if !crate::events::on() {
+        return;
+    }
+    let files: Vec<serde_json::Value> = info.files.iter().map(|f| serde_json::json!({
+        "name": clean(&f.name), "uti": clean(&f.uti), "size": f.size, "dir": f.is_dir,
+    })).collect();
+    let total: Option<u64> = info.files.iter().map(|f| f.size).sum();
+    // The sender's preview, for the shell to show if it can decode it (an iPhone sends JPEG 2000).
+    let icon = info.icon.as_ref().and_then(|bytes| {
+        use std::os::unix::fs::OpenOptionsExt;
+        let ext = if bytes.starts_with(&[0xff, 0xd8]) { "jpg" } else if bytes.starts_with(b"\x89PNG") { "png" } else { "jp2" };
+        let path = crate::events::runtime_dir()?.join(format!("icon-{id}.{ext}"));
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path).ok()?;
+        f.write_all(bytes).ok()?;
+        Some(path.display().to_string())
+    });
+    crate::events::emit("ask", serde_json::json!({
+        "id": id, "sender": info.sender_name.as_deref().map(clean), "model": clean(&info.sender_model),
+        "kind": crate::events::kind(&info.sender_model), "known": known, "asking": asking, "timeout": timeout,
+        "files": files, "urls": info.urls.iter().map(|u| clean(u)).collect::<Vec<_>>(), "total": total, "icon": icon,
+    }));
+}
+
+async fn decide(inner: &Inner, info: &AskInfo, id: u64) -> bool {
     let name = clean(info.sender_label());
     let known = info.sender_name.as_deref().is_some_and(|n| inner.cfg.lock().expect("not poisoned").is_known(n));
-    let decision = if known {
+    let (decision, by) = if known {
         eprintln!("AirDrop from known sender {name}: {} (auto-accepted)", describe(info));
-        Decision::Accept
+        ask_event(info, id, true, false, 0);
+        (Decision::Accept, "known")
     } else {
         let _busy = OpenGuard::new(&inner.activity.open);
-        inner.prompter.ask(info).await
+        let p = &inner.prompter;
+        p.ask(info, id, || ask_event(info, id, false, p.is_interactive(), p.timeout())).await
     };
+    crate::events::emit("answered", serde_json::json!({ "id": id, "by": by, "decision": match decision {
+        Decision::Accept => "accept",
+        Decision::Always => "always",
+        Decision::Decline => "decline",
+    } }));
     if decision == Decision::Always {
         match &info.sender_name {
             Some(sender) => {
@@ -422,7 +468,8 @@ async fn decide(inner: &Inner, info: &AskInfo) -> bool {
     // nearby can send when everything is accepted.
     let open = inner.settings.open_urls && !known && inner.prompter.is_interactive();
     for url in &info.urls {
-        println!("LINK {}", clean(url));
+        crate::say!("LINK {}", clean(url));
+        crate::events::emit("link", serde_json::json!({ "id": id, "url": clean(url), "sender": info.sender_name.as_deref().map(clean) }));
         let web = url.starts_with("https://") || url.starts_with("http://");
         if open && web {
             if let Some(exe) = which("xdg-open") {
@@ -601,37 +648,52 @@ async fn upload(inner: &Arc<Inner>, mut grant: Grant, head: &Head, conn: &mut Co
     let names: Vec<String> = grant.info.files.iter().map(|f| f.name.clone()).collect();
     let sink = Sink::start(Extractor::new(&dest, dvzip, &roots, &names));
     let total = headers.get("totalbytes").and_then(|t| t.parse().ok());
-    let progress = Progress::new(total, format!("Receiving from {name}"));
+    let progress = Progress::new(total, format!("Receiving from {name}"), Some(grant.id));
+    let id = grant.id;
+    let failed = |message: String| crate::events::emit("transfer", serde_json::json!({
+        "id": id, "dir": "in", "phase": "failed", "message": message,
+    }));
     let mut dec = BodyDecoder::new(headers)?;
 
     if grant.decision.borrow().is_none() && !spool_until_decided(&mut grant, conn, &mut dec, &sink, &progress, &inner.activity, &dest).await? {
         progress.finish();
-        return reply(conn, 401, b"", false).await; // declined: nothing was written
+        reply(conn, 401, b"", false).await?; // declined: nothing was written
+        conn.linger(Duration::from_secs(2)).await; // so the sender reads the 401, not a reset
+        return Ok(false);
     }
+    crate::events::emit("transfer", serde_json::json!({ "id": id, "dir": "in", "phase": "receiving", "total": total,
+        "sender": grant.info.sender_name.as_deref().map(clean) }));
     let (outcome, body_done) = match stream_to_sink(sink, conn, &mut dec, &progress, &inner.activity, inner.settings.stall).await {
         Ok(Streamed::Finished(outcome, body_done)) => (outcome, body_done),
         Ok(Streamed::Stalled) => {
             progress.finish();
             eprintln!("Transfer from {name} stalled after {} (no data for {:.0} s); nothing was saved. Send it again from the device.",
                 human(progress.done() as f64), inner.settings.stall.as_secs_f64());
+            failed(format!("{name} stopped sending; nothing was saved"));
             return Ok(false);
         }
         Ok(Streamed::CutOff) => {
             progress.finish();
             eprintln!("Transfer from {name} was cut off after {}; nothing was saved.", human(progress.done() as f64));
+            failed(format!("{name} stopped sending; nothing was saved"));
             return Err(ConnError::Closed);
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            failed(format!("The transfer from {name} broke off; nothing was saved"));
+            return Err(e);
+        }
     };
     let elapsed = progress.finish();
     let outcome = match outcome {
         Ok(o) => o,
         Err(ExtractError::Unsafe(why)) => {
             eprintln!("Rejected upload from {name}: {}", clean(&why));
+            failed(format!("Refused: {}", clean(&why)));
             return reply(conn, 400, b"", false).await;
         }
         Err(ExtractError::Io(e)) => {
             eprintln!("Could not save files: {e}");
+            failed(format!("Could not save the files: {e}"));
             return reply(conn, 500, b"", false).await;
         }
     };
@@ -641,8 +703,13 @@ async fn upload(inner: &Arc<Inner>, mut grant: Grant, head: &Head, conn: &mut Co
     conn.write_all(&http::response(200, b"", body_done)).await?;
     eprintln!("Received {} from {name} in {elapsed:.1}s", human(outcome.bytes_written as f64));
     for p in &outcome.saved {
-        println!("SAVED {}", clean(&p.to_string_lossy()));
+        crate::say!("SAVED {}", clean(&p.to_string_lossy()));
     }
+    crate::events::emit("transfer", serde_json::json!({
+        "id": id, "dir": "in", "phase": "done", "sender": grant.info.sender_name.as_deref().map(clean),
+        "saved": outcome.saved.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "bytes": outcome.bytes_written, "seconds": (elapsed * 10.0).round() / 10.0,
+    }));
     inner.activity.completed.fetch_add(1, Ordering::Relaxed);
     inner.activity.touch();
     let n = outcome.saved.len();

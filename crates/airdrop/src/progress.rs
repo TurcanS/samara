@@ -1,4 +1,5 @@
-//! Single-line transfer progress on stderr; `add` may be called from any thread.
+//! Single-line transfer progress on stderr, and with `--json` a `progress` event at most
+//! five times a second; `add` may be called from any thread.
 
 use crate::util::{human, stderr_is_tty};
 use std::io::Write;
@@ -10,19 +11,27 @@ pub struct Progress {
     total: Option<u64>,
     label: String,
     done: AtomicU64,
+    /// A terminal to draw the line on.
+    tty: bool,
+    /// Off while a question is on screen.
     enabled: AtomicBool,
+    /// The transfer the `progress` events name (`--json`).
+    id: Option<u64>,
     start: Instant,
     last_draw: Mutex<Instant>,
 }
 
 impl Progress {
-    pub fn new(total: Option<u64>, label: String) -> Self {
+    pub fn new(total: Option<u64>, label: String, id: Option<u64>) -> Self {
         let start = Instant::now();
+        let id = id.filter(|_| crate::events::on());
         Self {
             total: total.filter(|&t| t > 0),
             label,
             done: AtomicU64::new(0),
-            enabled: AtomicBool::new(stderr_is_tty()),
+            tty: stderr_is_tty() && id.is_none(),
+            enabled: AtomicBool::new(true),
+            id,
             start,
             last_draw: Mutex::new(start),
         }
@@ -43,21 +52,35 @@ impl Progress {
 
     pub fn add(&self, n: u64) {
         self.done.fetch_add(n, Ordering::Relaxed);
-        if !self.enabled() {
+        if !self.enabled() || !(self.tty || self.id.is_some()) {
             return;
         }
         let Ok(mut last) = self.last_draw.try_lock() else { return };
         let now = Instant::now();
         if now.duration_since(*last).as_secs_f64() >= 0.2 {
             *last = now;
+            self.report(now);
+        }
+    }
+
+    fn rate(&self, now: Instant) -> f64 {
+        self.done() as f64 / now.duration_since(self.start).as_secs_f64().max(1e-6)
+    }
+
+    fn report(&self, now: Instant) {
+        if let Some(id) = self.id {
+            crate::events::emit("progress", serde_json::json!({
+                "id": id, "done": self.total.map_or(self.done(), |t| self.done().min(t)), "total": self.total, "rate": self.rate(now).round(),
+            }));
+        }
+        if self.tty {
             self.render(now);
         }
     }
 
     fn render(&self, now: Instant) {
-        let elapsed = now.duration_since(self.start).as_secs_f64().max(1e-6);
         let done = self.done() as f64;
-        let rate = done / elapsed;
+        let rate = self.rate(now);
         let line = match self.total {
             Some(total) => {
                 let total = total as f64;
@@ -72,12 +95,14 @@ impl Progress {
         let _ = err.flush();
     }
 
-    /// Draw a last time and end the line; returns the seconds elapsed.
+    /// Report a last time and end the line; returns the seconds elapsed.
     pub fn finish(&self) -> f64 {
         let now = Instant::now();
         if self.enabled() {
-            self.render(now);
-            eprintln!();
+            self.report(now);
+            if self.tty {
+                eprintln!();
+            }
         }
         now.duration_since(self.start).as_secs_f64().max(1e-6)
     }

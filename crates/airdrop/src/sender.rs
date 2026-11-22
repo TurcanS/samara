@@ -169,7 +169,8 @@ impl Sender {
     }
 
     /// Send files or a link to `peer` (already discovered, or discovered here).
-    pub async fn send(&self, peer: &mut Peer, what: &What) -> Result<()> {
+    /// `id` names the transfer in `--json` events (`transfer` asking / sending, `progress`).
+    pub async fn send(&self, peer: &mut Peer, what: &What, id: u64) -> Result<()> {
         let plan = match what {
             What::Files(paths) => Some(plan_archive(paths).map_err(|e| SendError::Failed(e.to_string()))?), // stat before asking
             What::Link(_) => None,
@@ -202,7 +203,9 @@ impl Sender {
             }
         };
         let label = peer.label();
-        println!("Waiting for {label} to accept {} ...", clean(&shown));
+        crate::say!("Waiting for {label} to accept {} ...", clean(&shown));
+        crate::events::emit("transfer", serde_json::json!({ "id": id, "dir": "out", "peer": peer.host(), "phase": "asking",
+            "total": plan.as_ref().map(|p| p.total_bytes) }));
         match self.post(&mut conn, peer, "/Ask", &ask, ASK_TIMEOUT, true).await {
             Ok((200, _)) => {}
             Ok((status, _)) => return Err(SendError::Declined(format!("{label} declined (HTTP {status})"))),
@@ -214,17 +217,22 @@ impl Sender {
         }
         match plan {
             None => {
-                println!("Sent link to {label}.");
+                crate::say!("Sent link to {label}.");
                 conn.shutdown().await;
                 Ok(())
             }
-            Some(plan) => self.upload(&mut conn, plan, &label, &transfer_id).await,
+            Some(plan) => {
+                crate::events::emit("transfer", serde_json::json!({ "id": id, "dir": "out", "peer": peer.host(), "phase": "sending",
+                    "total": plan.total_bytes }));
+                self.upload(&mut conn, plan, &label, &transfer_id, id).await
+            }
         }
     }
 
-    async fn upload(&self, conn: &mut Conn<Stream>, plan: airdrop_proto::cpio::ArchivePlan, label: &str, transfer_id: &str) -> Result<()> {
+    async fn upload(&self, conn: &mut Conn<Stream>, plan: airdrop_proto::cpio::ArchivePlan, label: &str, transfer_id: &str, id: u64)
+        -> Result<()> {
         let total = plan.total_bytes;
-        let progress = Arc::new(Progress::new(Some(total), format!("Sending to {label}")));
+        let progress = Arc::new(Progress::new(Some(total), format!("Sending to {label}"), Some(id)));
         // The header set and order of a real iOS 26 /Upload. The pseudonym and push token
         // name an Apple account we do not have; receivers carry them without checking.
         let pseudonym = base64::engine::general_purpose::STANDARD_NO_PAD.encode(random_bytes::<16>());
@@ -264,7 +272,7 @@ impl Sender {
         }
         let sent: std::result::Result<(), Stopped> = async {
             if !delay.is_zero() {
-                println!("Experiment: starting the upload {:.0} s late.", delay.as_secs_f64());
+                crate::say!("Experiment: starting the upload {:.0} s late.", delay.as_secs_f64());
                 tokio::time::sleep(delay).await;
             }
             tokio::time::timeout(stall, conn.write_all(&head)).await.map_err(|_| Stopped::Conn(ConnError::Timeout))?.map_err(Stopped::Conn)?;
@@ -327,7 +335,7 @@ impl Sender {
         match status {
             200 => {
                 let rate = total as f64 / elapsed;
-                println!("Sent {} to {label} in {elapsed:.1}s ({}/s).", human(total as f64), human(rate));
+                crate::say!("Sent {} to {label} in {elapsed:.1}s ({}/s).", human(total as f64), human(rate));
                 Ok(())
             }
             // Early-ask receivers say yes to /Ask at once and refuse here instead.

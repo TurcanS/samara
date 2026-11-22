@@ -10,7 +10,8 @@ use crate::link::{self, Link, LinkError, Options};
 use crate::mdns::Mdns;
 use crate::prompt::{stdin_lines, Prompter};
 use crate::receiver::{Receiver, Settings};
-use crate::sender::{scoped, txt_flags, Peer, Sender, What};
+use crate::events::{Command, Payload};
+use crate::sender::{scoped, txt_flags, Peer, SendError, Sender, What};
 use crate::stop::{Interrupted, Stop};
 use crate::util::{clean, clock, which};
 use airdrop_proto::wire::APPLE_PORT;
@@ -30,6 +31,7 @@ fn link_failed(e: LinkError) -> Result<i32, Interrupted> {
         LinkError::Interrupted => Err(Interrupted),
         LinkError::Failed(m) => {
             eprintln!("AWDL: {m}");
+            crate::events::error(crate::events::link_code(&m), &m);
             Ok(1)
         }
     }
@@ -64,11 +66,24 @@ impl Stats {
     }
 }
 
+/// What a search reports.
+enum Seen {
+    Found(Peer),
+    /// A device that answered has left the radio (its AWDL neighbour entry is gone); the
+    /// text is its address as `Peer::host` writes it. Found again if it comes back.
+    Lost(String),
+}
+
+/// A device that answered and is no longer an AWDL neighbour for this long has gone (OWL
+/// drops a peer it has not heard for a few seconds).
+const LOST_AFTER: Duration = Duration::from_secs(12);
+
 /// mDNS browse plus owly DISC-5: an iPhone's mDNS often never reaches awdl0, so every AWDL
 /// neighbour also gets a /Discover on Apple's port directly (a receiver refuses until the
-/// BLE advert has woken it, so this keeps trying). Each answering device arrives once.
+/// BLE advert has woken it, so this keeps trying). Each answering device arrives once,
+/// until it leaves.
 fn search(link: &Link, mdns: &mut Mdns, cfg: &Config, sender: Arc<Sender>, dump: Option<Arc<Dump>>, stats: Arc<Mutex<Stats>>)
-    -> (mpsc::Receiver<Peer>, JoinSet<()>) {
+    -> (mpsc::Receiver<Seen>, JoinSet<()>) {
     let (tx, rx) = mpsc::channel(32);
     let mut tasks = JoinSet::new();
     let reported = Arc::new(Mutex::new(HashSet::<Ipv6Addr>::new()));
@@ -77,7 +92,7 @@ fn search(link: &Link, mdns: &mut Mdns, cfg: &Config, sender: Arc<Sender>, dump:
     // One /Discover per device at a time; report it once.
     let check = {
         let (reported, busy, stats, sender) = (reported.clone(), busy.clone(), stats.clone(), sender.clone());
-        move |ip: Ipv6Addr, port: u16, service: String, iface: String, tx: mpsc::Sender<Peer>| {
+        move |ip: Ipv6Addr, port: u16, service: String, iface: String, tx: mpsc::Sender<Seen>| {
             let (reported, busy, stats, sender) = (reported.clone(), busy.clone(), stats.clone(), sender.clone());
             async move {
                 if reported.lock().expect("not poisoned").contains(&ip) || !busy.lock().expect("not poisoned").insert(ip) {
@@ -93,7 +108,7 @@ fn search(link: &Link, mdns: &mut Mdns, cfg: &Config, sender: Arc<Sender>, dump:
                 }
                 if reported.lock().expect("not poisoned").insert(ip) {
                     stats.lock().expect("not poisoned").answered += 1;
-                    let _ = tx.send(peer).await;
+                    let _ = tx.send(Seen::Found(peer)).await;
                 }
                 true
             }
@@ -114,10 +129,20 @@ fn search(link: &Link, mdns: &mut Mdns, cfg: &Config, sender: Arc<Sender>, dump:
     let own = link.address;
     tasks.spawn(async move {
         let mut inflight: HashMap<Ipv6Addr, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut heard: HashMap<Ipv6Addr, Instant> = HashMap::new();
         loop {
             let i = iface.clone();
             let neighbours = tokio::task::spawn_blocking(move || link::awdl_neighbors(&i)).await.unwrap_or_default();
+            let now = Instant::now();
+            let gone: Vec<Ipv6Addr> = heard.iter().filter(|(a, t)| !neighbours.contains(a) && now - **t > LOST_AFTER).map(|(a, _)| *a).collect();
+            for addr in gone {
+                heard.remove(&addr);
+                if reported.lock().expect("not poisoned").remove(&addr) {
+                    let _ = tx.send(Seen::Lost(format!("{addr}%{iface}"))).await;
+                }
+            }
             for addr in neighbours.into_iter().filter(|a| *a != own) {
+                heard.insert(addr, now);
                 stats.lock().expect("not poisoned").radio_peers.insert(addr);
                 if reported.lock().expect("not poisoned").contains(&addr) || inflight.get(&addr).is_some_and(|t| !t.is_finished()) {
                     continue;
@@ -185,10 +210,11 @@ pub async fn find(cfg: Config, stop: &Stop, dump: Option<PathBuf>, timeout: f64)
     tokio::pin!(end);
     let outcome = loop {
         tokio::select! {
-            Some(p) = peers.recv() => {
+            Some(seen) = peers.recv() => {
+                let Seen::Found(p) = seen else { continue };
                 found += 1;
                 let state = if p.available() { "available" } else { "contacts only (not reachable)" };
-                println!("{}\t{}\t{state}\t[{}]:{}", p.name.as_deref().map_or("(unnamed)".into(), clean),
+                crate::say!("{}\t{}\t{state}\t[{}]:{}", p.name.as_deref().map_or("(unnamed)".into(), clean),
                     p.model.as_deref().map_or("-".into(), clean), p.host(), p.addr.port());
             }
             () = &mut end => break Ok(()),
@@ -234,7 +260,8 @@ pub async fn send(cfg: Config, stop: &Stop, sender: Sender, what: What, receiver
     // The timeout bounds only the search; the transfer runs with the link still up.
     let chosen: Result<Option<Peer>, String> = loop {
         tokio::select! {
-            Some(p) = found.recv() => {
+            Some(seen) = found.recv() => {
+                let Seen::Found(p) = seen else { continue };
                 if !p.available() {
                     if hidden.insert(p.host()) {
                         eprintln!("  found {} at [{}], but it is not accepting from everyone: on the iPhone set AirDrop to \
@@ -299,6 +326,179 @@ pub async fn send(cfg: Config, stop: &Stop, sender: Sender, what: What, receiver
     code
 }
 
+/// A `peer` event.
+fn emit_peer(p: &Peer) {
+    let model = p.model.as_deref().map(clean).unwrap_or_default();
+    crate::events::emit("peer", serde_json::json!({
+        "id": p.host(), "name": p.name.as_deref().map(clean), "kind": crate::events::kind(&model), "model": model,
+        "available": p.available(),
+    }));
+}
+
+/// What a `pick` asked to send, checked the way the command line checks its arguments.
+fn payload(p: Payload) -> Result<What, String> {
+    match p {
+        Payload::Link(url) => Ok(What::Link(url)),
+        Payload::Files(paths) if paths.is_empty() => Err("nothing to send: give paths or a url".into()),
+        Payload::Files(paths) => {
+            let mut resolved = vec![];
+            for p in paths {
+                if !p.is_absolute() || std::fs::symlink_metadata(&p).is_err() {
+                    return Err(format!("{}: no such file or directory", clean(&p.to_string_lossy())));
+                }
+                resolved.push(if p.file_name().is_none() { p.canonicalize().unwrap_or(p) } else { p });
+            }
+            Ok(What::Files(resolved))
+        }
+    }
+}
+
+/// One send running in the background: the peer comes back with the outcome.
+type Delivery = tokio::task::JoinHandle<(Peer, Result<(), SendError>)>;
+
+/// `send --json`: keep the link up and the device list live; send what each `pick` names
+/// to the device it names, one transfer at a time, until `done`, a stop, or `idle` seconds
+/// with nothing picked and nothing running. `fixed` skips AWDL (`--peer`, for tests).
+pub async fn send_json(cfg: Config, stop: &Stop, sender: Sender, idle: f64, fixed: Option<Peer>) -> Result<i32, Interrupted> {
+    let sender = Arc::new(sender);
+    let idle = Duration::from_secs_f64(idle.max(1.0));
+    let mut session = None;
+    let mut tasks = JoinSet::new();
+    let (seen_tx, mut seen) = mpsc::channel::<Seen>(32);
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    match fixed {
+        Some(mut p) => {
+            let sender = sender.clone();
+            tasks.spawn(async move {
+                if sender.discover(&mut p).await.is_ok() {
+                    let _ = seen_tx.send(Seen::Found(p)).await;
+                }
+            });
+        }
+        None => {
+            let mut s = match Session::up(&cfg, stop, Options { ble: true, fast: false, quiet: false, sending: true, channel: None }).await {
+                Ok(s) => s,
+                Err(e) => return link_failed(e),
+            };
+            stats.lock().expect("not poisoned").channel.clone_from(&s.link.channel);
+            let (mut found, search_tasks) = search(&s.link, &mut s.mdns, &cfg, sender.clone(), sender.dump.clone(), stats.clone());
+            // Forward into one channel, so the fixed peer and the search look the same below.
+            tasks.spawn(async move {
+                let _keep = search_tasks; // aborted when this task is
+                while let Some(x) = found.recv().await {
+                    if seen_tx.send(x).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            session = Some(s);
+        }
+    }
+    crate::events::emit("searching", serde_json::json!({}));
+    let mut peers: HashMap<String, Peer> = HashMap::new();
+    let mut running: Option<(u64, String, Delivery)> = None;
+    let mut sent_any = false;
+    let mut quiet_since = Instant::now();
+    let mut done = false;
+    let code = loop {
+        let until_idle = (quiet_since + idle).saturating_duration_since(Instant::now());
+        tokio::select! {
+            Some(x) = seen.recv() => match x {
+                Seen::Found(p) => {
+                    emit_peer(&p);
+                    peers.insert(p.host(), p);
+                }
+                Seen::Lost(id) => {
+                    if peers.remove(&id).is_some() {
+                        crate::events::emit("peer_lost", serde_json::json!({ "id": id }));
+                    }
+                }
+            },
+            r = async { (&mut running.as_mut().expect("guarded").2).await }, if running.is_some() => {
+                let (id, _, _) = running.take().expect("was running");
+                let (peer, result) = match r {
+                    Ok(v) => v,
+                    Err(_) => continue, // cancelled: already reported
+                };
+                sent_any |= result.is_ok();
+                crate::cli::report_sent(id, &peer, result);
+                peers.insert(peer.host(), peer);
+                quiet_since = Instant::now();
+                if done {
+                    break Ok(0);
+                }
+            }
+            cmd = crate::events::next_command() => match cmd {
+                Some(Command::Pick { peer, payload: what }) => {
+                    quiet_since = Instant::now();
+                    if running.is_some() {
+                        crate::events::error("busy", "a transfer is running; wait for it or cancel it first");
+                        continue;
+                    }
+                    let Some(p) = peers.get(&peer).cloned() else {
+                        crate::events::error("input", "that device is no longer nearby");
+                        continue;
+                    };
+                    let what = match payload(what) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            crate::events::error("input", &e);
+                            continue;
+                        }
+                    };
+                    let id = crate::events::next_id();
+                    let sender = sender.clone();
+                    let host = p.host();
+                    running = Some((id, host, tokio::spawn(async move {
+                        let mut p = p;
+                        let r = sender.send(&mut p, &what, id).await;
+                        (p, r)
+                    })));
+                }
+                Some(Command::Cancel(id)) => {
+                    if let Some((rid, host, task)) = running.take_if(|(rid, _, _)| *rid == id) {
+                        task.abort(); // drops the connection; the reader thread ends with it
+                        eprintln!("Cancelled.");
+                        crate::events::emit("transfer", serde_json::json!({ "id": rid, "dir": "out", "peer": host, "phase": "cancelled" }));
+                        quiet_since = Instant::now();
+                    }
+                }
+                Some(Command::Done) | None => {
+                    done = true;
+                    if running.is_none() {
+                        break Ok(0);
+                    }
+                }
+            },
+            () = tokio::time::sleep(until_idle), if running.is_none() => {
+                let hint = stats.lock().expect("not poisoned").hint();
+                crate::events::emit("search_end", serde_json::json!({ "reason": "idle", "found": peers.len(), "hint": hint.trim() }));
+                break Ok(if sent_any || !peers.is_empty() { 0 } else { EXIT_NOT_FOUND });
+            }
+            reason = async { session.as_ref().expect("guarded").link.failed().await }, if session.is_some() => {
+                crate::events::error(crate::events::link_code(&reason), &reason);
+                eprintln!("AWDL: {reason}");
+                break Ok(1);
+            }
+            () = stop.wait(), if !done => {
+                if running.is_none() {
+                    break Ok(0);
+                }
+                done = true; // let the running transfer end, as `done` does
+            }
+        }
+    };
+    if let Some((id, host, task)) = running.take() {
+        task.abort();
+        crate::events::emit("transfer", serde_json::json!({ "id": id, "dir": "out", "peer": host, "phase": "cancelled" }));
+    }
+    tasks.abort_all();
+    if let Some(s) = session {
+        s.close().await;
+    }
+    code
+}
+
 // ---- receive ---------------------------------------------------------------------------
 
 /// Keep a Bluetooth LE scan running while we receive (unprivileged, Wi-Fi untouched).
@@ -345,6 +545,7 @@ pub async fn receive(cfg: Config, stop: &Stop, settings: Settings, prompter: Pro
             Ok(r) => r,
             Err(e) => {
                 eprintln!("cannot listen on [{}%{}]:{}: {e}", s.link.address, s.link.iface, addr.port());
+                crate::events::error("start", &format!("cannot listen on port {}: {e}", addr.port()));
                 s.close().await;
                 break Ok(1);
             }
@@ -352,7 +553,8 @@ pub async fn receive(cfg: Config, stop: &Stop, settings: Settings, prompter: Pro
         s.mdns.register(&service_id, port, s.link.address, txt_flags()).await;
         if !announced {
             announced = true;
-            println!("Visible as '{}'. Files go to {}. Press Ctrl-C to stop.", clean(&name), dir.display());
+            crate::say!("Visible as '{}'. Files go to {}. Press Ctrl-C to stop.", clean(&name), dir.display());
+            crate::events::emit("visible", serde_json::json!({ "name": clean(&name), "dir": dir, "port": port }));
         }
         /// Why this link ended.
         enum End {
@@ -472,8 +674,16 @@ impl Sheets {
                         continue;
                     }
                     Some(Ok(_)) => continue,
-                    Some(Err(e)) => { eprintln!("Bluetooth: {e}"); return Ok(ControlFlow::Break(1)) }
-                    None => { eprintln!("Bluetooth: the scan stopped"); return Ok(ControlFlow::Break(1)) }
+                    Some(Err(e)) => {
+                        eprintln!("Bluetooth: {e}");
+                        crate::events::error("bluetooth", &format!("Bluetooth: {e}"));
+                        return Ok(ControlFlow::Break(1));
+                    }
+                    None => {
+                        eprintln!("Bluetooth: the scan stopped");
+                        crate::events::error("bluetooth", "The Bluetooth scan stopped");
+                        return Ok(ControlFlow::Break(1));
+                    }
                 },
                 _ = tick.tick() => {}
                 () = stop.wait() => return Err(Interrupted),
@@ -512,7 +722,7 @@ pub async fn listen(cfg: Config, stop: &Stop, dry_run: bool, hashes: Vec<String>
     let who = if wanted.is_empty() { "any iPhone nearby".to_string() } else { format!("only devices with hash {}", hash_list(&wanted)) };
     let adverts = ble::watch();
     if dry_run {
-        println!("Listening on Bluetooth only (Wi-Fi {wifi}, left alone; test mode, nothing is changed). Reacting to {who}. Ctrl-C to stop.");
+        crate::say!("Listening on Bluetooth only (Wi-Fi {wifi}, left alone; test mode, nothing is changed). Reacting to {who}. Ctrl-C to stop.");
         return watch_only(adverts, &wanted, stop).await;
     }
 
@@ -520,6 +730,7 @@ pub async fn listen(cfg: Config, stop: &Stop, dry_run: bool, hashes: Vec<String>
         Ok(a) => a,
         Err(e) => {
             eprintln!("TLS identity: {e}");
+            crate::events::error("start", &format!("TLS identity: {e}"));
             return Ok(1);
         }
     };
@@ -527,12 +738,14 @@ pub async fn listen(cfg: Config, stop: &Stop, dry_run: bool, hashes: Vec<String>
         Ok(s) => s,
         Err(e) => {
             eprintln!("config error: {e}");
+            crate::events::error("config", &e);
             return Ok(2);
         }
     };
-    println!("Listening for AirDrop as '{}' (Wi-Fi {wifi} and left alone until {who} opens AirDrop; then it is paused for the \
+    crate::say!("Listening for AirDrop as '{}' (Wi-Fi {wifi} and left alone until {who} opens AirDrop; then it is paused for the \
               transfer and reconnected). Files go to {}{}. Ctrl-C to stop.", clean(&cfg.name), cfg.download_dir.display(),
              if prompter.is_interactive() { ", after asking" } else { " without asking (--ask to be asked)" });
+    crate::events::emit("listen", serde_json::json!({ "state": "idle", "name": clean(&cfg.name), "dir": cfg.download_dir }));
     let mut sheets = Sheets { adverts, wanted, episodes: HashMap::new(), last_advert: None, ended: false };
     let served = Served { cfg: &cfg, settings: &settings, prompter: &prompter, acceptor: &acceptor };
     loop {
@@ -559,10 +772,10 @@ async fn watch_only(mut adverts: Adverts, wanted: &BTreeSet<String>, stop: &Stop
                         }
                         _ => {
                             if let Some(ep) = ep {
-                                println!("           ...that one lasted {:.1} s, {} adverts", (ep.last - ep.first).as_secs_f64(), ep.adverts);
+                                crate::say!("           ...that one lasted {:.1} s, {} adverts", (ep.last - ep.first).as_secs_f64(), ep.adverts);
                             }
                             total += 1;
-                            println!("{}  AirDrop opened nearby: hashes {}{}", clock(), hash_list(&a.hashes),
+                            crate::say!("{}  AirDrop opened nearby: hashes {}{}", clock(), hash_list(&a.hashes),
                                 if a.matches(wanted) { "  <- would trigger" } else { "  (ignored: not in the list)" });
                             episodes.insert(a.hashes, Episode { first: a.when, last: a.when, served: false, adverts: 1 });
                         }
@@ -575,9 +788,9 @@ async fn watch_only(mut adverts: Adverts, wanted: &BTreeSet<String>, stop: &Stop
         }
     };
     for (h, ep) in &episodes {
-        println!("last from {}: {:.1} s, {} adverts", hash_list(h), (ep.last - ep.first).as_secs_f64(), ep.adverts);
+        crate::say!("last from {}: {:.1} s, {} adverts", hash_list(h), (ep.last - ep.first).as_secs_f64(), ep.adverts);
     }
-    println!("{total} opening(s) seen");
+    crate::say!("{total} opening(s) seen");
     code
 }
 
@@ -595,13 +808,16 @@ impl Served<'_> {
     async fn once(&self, stop: &Stop, sheets: &mut Sheets) -> Result<(), Interrupted> {
         let cfg = self.cfg;
         let t0 = Instant::now();
-        println!("{}  AirDrop opened nearby: pausing Wi-Fi and becoming visible...", clock());
+        crate::say!("{}  AirDrop opened nearby: pausing Wi-Fi and becoming visible...", clock());
+        crate::events::emit("listen", serde_json::json!({ "state": "triggered" }));
         let quiet = !crate::is_verbose();
         let mut s = match Session::up(cfg, stop, Options { ble: false, fast: true, quiet, sending: false, channel: None }).await {
             Ok(s) => s,
             Err(LinkError::Interrupted) => return Err(Interrupted),
             Err(LinkError::Failed(m)) => {
                 eprintln!("AWDL: {m}");
+                crate::events::error(crate::events::link_code(&m), &m);
+                crate::events::emit("listen", serde_json::json!({ "state": "idle" }));
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 return Ok(());
             }
@@ -612,14 +828,17 @@ impl Served<'_> {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("cannot listen on [{}%{}]:{}: {e}", s.link.address, s.link.iface, cfg.port);
+                crate::events::error("start", &format!("cannot listen on port {}: {e}", cfg.port));
                 s.close().await;
+                crate::events::emit("listen", serde_json::json!({ "state": "idle" }));
                 return Ok(());
             }
         };
         s.mdns.register(&cfg.service_id, port, s.link.address, txt_flags()).await;
         let up = Instant::now();
-        println!("{}  Visible as '{}' {:.1} s after the trigger ({} mode, channel {}).", clock(), clean(&cfg.name),
+        crate::say!("{}  Visible as '{}' {:.1} s after the trigger ({} mode, channel {}).", clock(), clean(&cfg.name),
                  (up - t0).as_secs_f64(), s.link.mode, s.link.channel);
+        crate::events::emit("visible", serde_json::json!({ "name": clean(&cfg.name), "dir": cfg.download_dir, "port": port }));
         let stopped = serve_until_done(&mut s, &rx, sheets, stop, up).await;
         rx.close().await;
         let t_down = Instant::now();
@@ -628,8 +847,9 @@ impl Served<'_> {
             return Err(Interrupted);
         }
         let now = Instant::now();
-        println!("{}  Wi-Fi is back ({:.1} s to reconnect; paused {:.1} s in total). Listening again.", clock(),
+        crate::say!("{}  Wi-Fi is back ({:.1} s to reconnect; paused {:.1} s in total). Listening again.", clock(),
                  (now - t_down).as_secs_f64(), (now - t0).as_secs_f64());
+        crate::events::emit("listen", serde_json::json!({ "state": "idle", "paused": ((now - t0).as_secs_f64() * 10.0).round() / 10.0 }));
         Ok(())
     }
 }
@@ -648,7 +868,7 @@ async fn serve_until_done(s: &mut Session, rx: &Receiver, sheets: &mut Sheets, s
         let act = rx.activity();
         if act.requests() > 0 && !first_request {
             first_request = true;
-            println!("{}  The iPhone found us {:.1} s after we became visible.", clock(), (now - up).as_secs_f64());
+            crate::say!("{}  The iPhone found us {:.1} s after we became visible.", clock(), (now - up).as_secs_f64());
         }
         if act.busy() {
             continue;
@@ -658,11 +878,11 @@ async fn serve_until_done(s: &mut Session, rx: &Receiver, sheets: &mut Sheets, s
             return false;
         }
         if !sheets.sheet_open(now) && idle > NO_CONTACT {
-            println!("{}  Nothing was sent to us.", clock());
+            crate::say!("{}  Nothing was sent to us.", clock());
             return false;
         }
         if idle > MAX_IDLE {
-            println!("{}  Nothing was sent to us for {} s.", clock(), MAX_IDLE.as_secs());
+            crate::say!("{}  Nothing was sent to us for {} s.", clock(), MAX_IDLE.as_secs());
             return false;
         }
     }
@@ -673,7 +893,7 @@ async fn serve_until_done(s: &mut Session, rx: &Receiver, sheets: &mut Sheets, s
 pub async fn recover(cfg: &Config) -> Result<i32, Interrupted> {
     match link::recover(&cfg.wifi_iface).await {
         Ok(steps) => {
-            println!("Restored: {}", if steps.is_empty() { "nothing needed".into() } else { steps.join(", ") });
+            crate::say!("Restored: {}", if steps.is_empty() { "nothing needed".into() } else { steps.join(", ") });
             Ok(0)
         }
         Err(e) => {
@@ -703,7 +923,10 @@ fn sh_quote(s: &str) -> String {
 
 pub fn doctor(cfg: &Config) -> i32 {
     let mut ok_all = true;
+    let mut checks: Vec<serde_json::Value> = vec![];
     let mut row = |ok: Option<bool>, label: &str, detail: &str| {
+        checks.push(serde_json::json!({ "label": label, "detail": detail,
+            "level": match ok { Some(true) => "ok", Some(false) => "error", None => "info" } }));
         let mark = match ok {
             Some(true) => "ok ",
             Some(false) => {
@@ -712,7 +935,7 @@ pub fn doctor(cfg: &Config) -> i32 {
             }
             None => "-- ",
         };
-        println!("[{mark}] {label}{}", if detail.is_empty() { String::new() } else { format!(": {detail}") });
+        crate::say!("[{mark}] {label}{}", if detail.is_empty() { String::new() } else { format!(": {detail}") });
     };
     row(Some(which("pkexec").is_some()), "pkexec (polkit)", "");
     // pkexec runs elsewhere: the install line needs an absolute path, so name the helper
@@ -832,6 +1055,8 @@ pub fn doctor(cfg: &Config) -> i32 {
     row(Some(has_bt), "Bluetooth controller", if has_bt { "" } else { "needed for the BLE wake-up and for listen" });
     let nm = Path::new("/run/NetworkManager").exists();
     row(nm.then_some(true), "NetworkManager", if nm { "" } else { "not running: borrow mode cannot pause and reconnect Wi-Fi" });
-    println!("\nname: {}   downloads: {}   config: {}", clean(&cfg.name), cfg.download_dir.display(), config_path().display());
+    crate::say!("\nname: {}   downloads: {}   config: {}", clean(&cfg.name), cfg.download_dir.display(), config_path().display());
+    crate::events::emit("doctor", serde_json::json!({ "ok": ok_all, "checks": checks, "name": clean(&cfg.name),
+        "dir": cfg.download_dir, "config": config_path() }));
     i32::from(!ok_all)
 }

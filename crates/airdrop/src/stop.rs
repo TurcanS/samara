@@ -11,12 +11,14 @@ use tokio::sync::watch;
 pub struct Interrupted;
 
 #[derive(Clone)]
-pub struct Stop(watch::Receiver<bool>);
+pub struct Stop(watch::Receiver<bool>, std::sync::Arc<watch::Sender<bool>>);
 
 impl Stop {
     /// Install the SIGINT/SIGTERM handlers.
     pub fn install() -> Self {
         let (tx, rx) = watch::channel(false);
+        let tx = std::sync::Arc::new(tx);
+        let own = tx.clone();
         tokio::spawn(async move {
             let (Ok(mut int), Ok(mut term)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) else {
                 return;
@@ -40,7 +42,12 @@ impl Stop {
                 }
             }
         });
-        Self(rx)
+        Self(rx, own)
+    }
+
+    /// Stop as a signal would (`--json`: the driving program said `done` or went away).
+    pub fn request(&self) {
+        let _ = self.1.send(true);
     }
 
     pub fn requested(&self) -> bool {

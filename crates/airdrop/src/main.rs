@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod conn;
 mod dump;
+mod events;
 mod link;
 mod link_cmds;
 mod mdns;
@@ -37,10 +38,26 @@ macro_rules! verbose {
     };
 }
 
+/// A line for the person reading stdout; on stderr with `--json`, where stdout carries
+/// only events.
+#[macro_export]
+macro_rules! say {
+    ($($arg:tt)*) => {
+        if $crate::events::on() {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+
 fn main() {
     use clap::Parser;
     let args = cli::Cli::parse();
     VERBOSE.store(args.global.verbose, Ordering::Relaxed);
+    if args.global.json {
+        events::enable();
+    }
     let code = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt.block_on(cli::run(args)),
         Err(e) => {
@@ -48,6 +65,7 @@ fn main() {
             1
         }
     };
+    events::cleanup();
     // Not a return from main: a thread blocked reading the terminal must not hold up exit.
     use std::io::Write;
     let _ = std::io::stdout().flush();

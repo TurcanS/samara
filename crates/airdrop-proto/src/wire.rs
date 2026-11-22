@@ -214,6 +214,8 @@ pub struct AskFile {
     pub is_dir: bool,
     /// The item's place in the upload archive.
     pub bom_path: String,
+    /// `FileSize`, when the sender gave one.
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +228,8 @@ pub struct AskInfo {
     /// Links, taken from `Items` only for a link transfer (or one with no files).
     pub urls: Vec<String>,
     pub transfer_id: Option<String>,
+    /// `FileIcon`: the sender's preview (JPEG 2000 from an iPhone), if any.
+    pub icon: Option<Vec<u8>>,
 }
 
 impl AskInfo {
@@ -238,6 +242,7 @@ impl AskInfo {
                 uti: text(f, "FileType").unwrap_or_else(|| "public.data".into()),
                 is_dir: f.get("FileIsDirectory").and_then(Value::as_boolean).unwrap_or(false),
                 bom_path: text(f, "FileBomPath").unwrap_or_default(),
+                size: f.get("FileSize").and_then(Value::as_unsigned_integer),
             }).collect()
         }).unwrap_or_default();
         let kind = d.get("TransferType").and_then(Value::as_dictionary);
@@ -259,6 +264,7 @@ impl AskInfo {
             files,
             urls,
             transfer_id: d.get("TransferID").and_then(Value::as_dictionary).and_then(|t| text(t, "id")),
+            icon: d.get("FileIcon").and_then(Value::as_data).filter(|b| !b.is_empty()).map(<[u8]>::to_vec),
         })
     }
 

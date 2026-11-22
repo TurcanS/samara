@@ -47,12 +47,18 @@ pub struct Global {
     /// AWDL channel (auto: 149 in borrow mode; 6 for an iPhone whose Wi-Fi is on 2.4 GHz or off)
     #[arg(long, global = true, value_parser = ["auto", "6", "36", "44", "149"])]
     pub channel: Option<String>,
+    /// Events as JSON lines on stdout, commands as JSON lines on stdin (for a desktop shell;
+    /// README "Machine interface"). Implies --no-open; with --ask, questions are answered on stdin
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum PrompterKind {
     Terminal,
     Notify,
+    /// `ask` events answered on stdin (what --json uses)
+    Stdin,
 }
 
 #[derive(Subcommand)]
@@ -193,20 +199,30 @@ pub async fn run(args: Cli) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {e}");
+            if args.global.json {
+                crate::events::enable();
+                crate::events::error("config", &e);
+            }
             return 2;
         }
     };
     let stop = Stop::install();
+    let json = args.global.json;
+    if json && !matches!(args.cmd, Cmd::Config { .. } | Cmd::Doctor | Cmd::Recover) {
+        crate::events::start(&stop);
+    }
     let result = match args.cmd {
         Cmd::Config { action } => return config_cmd(&mut cfg, action),
+        Cmd::Send { timeout, dump, peer, .. } if json => send_json(cfg, &stop, timeout, dump, peer).await,
         Cmd::Send { paths, url, receiver, timeout, dump, peer } => send(cfg, &stop, paths, url, receiver, timeout, dump, peer).await,
         Cmd::Receive { ask, accept_all, prompter, ask_timeout, no_open, no_ble_scan, dump, port, no_link, bind, .. } => {
-            let prompter = make_prompter(ask && !accept_all, prompter, ask_timeout);
-            receive(cfg, &stop, prompter, !no_open, no_ble_scan, dump, port, no_link, &bind).await
+            let prompter = make_prompter(ask && !accept_all, if json { PrompterKind::Stdin } else { prompter }, ask_timeout);
+            receive(cfg, &stop, prompter, !no_open && !json, no_ble_scan, dump, port, no_link, &bind).await
         }
         Cmd::Find { dump, timeout } => crate::link_cmds::find(cfg, &stop, dump, timeout).await,
         Cmd::Listen { dry_run, hash, ask, prompter, ask_timeout, no_open, .. } => {
-            crate::link_cmds::listen(cfg, &stop, dry_run, hash, make_prompter(ask, prompter, ask_timeout), !no_open).await
+            let prompter = make_prompter(ask, if json { PrompterKind::Stdin } else { prompter }, ask_timeout);
+            crate::link_cmds::listen(cfg, &stop, dry_run, hash, prompter, !no_open && !json).await
         }
         Cmd::Doctor => Ok(crate::link_cmds::doctor(&cfg)),
         Cmd::Recover => crate::link_cmds::recover(&cfg).await,
@@ -226,6 +242,7 @@ fn make_prompter(ask: bool, kind: PrompterKind, timeout_s: u64) -> Prompter {
         (false, _) => Prompter::Static(Decision::Accept),
         (true, PrompterKind::Terminal) => Prompter::Terminal { timeout },
         (true, PrompterKind::Notify) => Prompter::Notification { timeout },
+        (true, PrompterKind::Stdin) => Prompter::Stdin { timeout },
     }
 }
 
@@ -304,6 +321,7 @@ async fn receive(cfg: Config, stop: &Stop, prompter: Prompter, open_urls: bool, 
         Ok(a) => a,
         Err(e) => {
             eprintln!("TLS identity: {e}");
+            crate::events::error("start", &format!("TLS identity: {e}"));
             return Ok(1);
         }
     };
@@ -315,14 +333,17 @@ async fn receive(cfg: Config, stop: &Stop, prompter: Prompter, open_urls: bool, 
         return Ok(2);
     };
     let name = cfg.name.clone();
+    let dir = cfg.download_dir.display().to_string();
     let (rx, port) = match Receiver::start(SocketAddr::new(ip, port.unwrap_or(0)), cfg, settings, prompter, acceptor, dump.map(std::sync::Arc::new)).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot listen on [{bind}]:{}: {e}", port.unwrap_or(0));
+            crate::events::error("start", &format!("cannot listen on port {}: {e}", port.unwrap_or(0)));
             return Ok(1);
         }
     };
-    println!("Listening on [{bind}]:{port} as '{}' (no AWDL).", crate::util::clean(&name));
+    crate::say!("Listening on [{bind}]:{port} as '{}' (no AWDL).", crate::util::clean(&name));
+    crate::events::emit("visible", serde_json::json!({ "name": crate::util::clean(&name), "dir": dir, "port": port }));
     stop.wait().await;
     rx.close().await;
     Err(Interrupted)
@@ -341,17 +362,31 @@ pub fn make_sender(cfg: &Config, dump: Option<Dump>) -> Result<Sender, String> {
 
 /// Send to one peer and turn the outcome into an exit code.
 pub async fn deliver(sender: &Sender, peer: &mut Peer, what: &What, stop: &Stop) -> Result<i32, Interrupted> {
-    match stop.guard(sender.send(peer, what)).await? {
-        Ok(()) => Ok(0),
+    let id = crate::events::next_id();
+    match stop.guard(sender.send(peer, what, id)).await {
+        Ok(result) => Ok(report_sent(id, peer, result)),
+        Err(Interrupted) => {
+            crate::events::emit("transfer", serde_json::json!({ "id": id, "dir": "out", "peer": peer.host(), "phase": "cancelled" }));
+            Err(Interrupted)
+        }
+    }
+}
+
+/// Say how a send ended (and emit its last `transfer` event); returns the exit code.
+pub fn report_sent(id: u64, peer: &Peer, result: Result<(), SendError>) -> i32 {
+    let (phase, message, code) = match result {
+        Ok(()) => ("done", String::new(), 0),
         Err(SendError::Declined(m)) => {
             eprintln!("{m}");
-            Ok(EXIT_DECLINED)
+            ("declined", m, EXIT_DECLINED)
         }
         Err(SendError::Failed(m)) => {
             eprintln!("Send failed: {m}");
-            Ok(1)
+            ("failed", m, 1)
         }
-    }
+    };
+    crate::events::emit("transfer", serde_json::json!({ "id": id, "dir": "out", "peer": peer.host(), "phase": phase, "message": message }));
+    code
 }
 
 /// `[v6]:port`, `[fe80::1%awdl0]:port` or `host:port`.
@@ -412,8 +447,42 @@ async fn send(cfg: Config, stop: &Stop, paths: Vec<String>, url: Option<String>,
     crate::link_cmds::send(cfg, stop, sender, what, receiver, timeout).await
 }
 
+/// `send --json`: the payload comes with each `pick` on stdin (see `link_cmds::send_json`).
+async fn send_json(cfg: Config, stop: &Stop, timeout: f64, dump: Option<PathBuf>, peer: Option<String>) -> Result<i32, Interrupted> {
+    let dump = match open_dump(dump) {
+        Ok(d) => d,
+        Err(code) => return Ok(code),
+    };
+    let sender = match make_sender(&cfg, dump) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            crate::events::error("start", &e);
+            return Ok(1);
+        }
+    };
+    let fixed = match peer {
+        None => None,
+        Some(text) => {
+            let Some((addr, iface)) = parse_peer(&text) else {
+                eprintln!("--peer: use HOST:PORT or [IPv6]:PORT");
+                return Ok(2);
+            };
+            Some(Peer::new(addr, iface))
+        }
+    };
+    crate::link_cmds::send_json(cfg, stop, sender, timeout, fixed).await
+}
+
 fn config_cmd(cfg: &mut Config, action: ConfigAction) -> i32 {
     match action {
+        ConfigAction::Show if crate::events::on() => {
+            crate::events::emit("config", serde_json::json!({
+                "name": cfg.name, "dir": cfg.download_dir, "known": cfg.known_senders, "mode": cfg.mode.as_str(),
+                "channel": cfg.channel.to_string(), "iface": cfg.wifi_iface, "path": config_path(),
+            }));
+            0
+        }
         ConfigAction::Show => {
             match std::fs::read_to_string(config_path()) {
                 Ok(t) => print!("{t}"),

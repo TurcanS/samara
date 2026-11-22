@@ -220,6 +220,7 @@ impl Link {
         if !opts.quiet {
             eprintln!("Starting AWDL (authentication may be required)...");
         }
+        crate::events::emit("session", serde_json::json!({ "phase": "starting", "mode": mode }));
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|e| format!("cannot run pkexec: {e}"))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("piped");
@@ -297,12 +298,20 @@ impl Link {
                             eprintln!("Wi-Fi is paused for this session and reconnects when AirDrop stops (if it does not: airdrop recover).");
                         }
                     }
+                    crate::events::emit("session", serde_json::json!({
+                        "phase": "up", "mode": self.mode, "channel": self.channel, "wifi_paused": self.mode == "borrow",
+                    }));
                     self.watcher = Some(tokio::spawn(watch_helper(lines, fail_tx, prefer_tx)));
                     return Ok(());
                 }
                 "error" => return Err(LinkError::Failed(if text.is_empty() { "AWDL helper failed".into() } else { text })),
                 "notice" if self.quiet => {}
-                "notice" | "warning" | "fallback" | "log" => eprintln!("{text}"),
+                "notice" | "warning" | "fallback" | "log" => {
+                    eprintln!("{text}");
+                    if matches!(msg["state"].as_str(), Some("notice" | "warning")) {
+                        crate::events::emit(msg["state"].as_str().unwrap_or("notice"), serde_json::json!({ "message": text }));
+                    }
+                }
                 _ => {} // inject_check, down
             }
         }
@@ -347,8 +356,13 @@ impl Link {
                 _ => crate::verbose!("the helper's output did not end"),
             }
         }
+        let wifi = self.mode == "borrow";
+        crate::events::emit("session", serde_json::json!({ "phase": "down", "wifi_restored": wifi && waited.is_ok() }));
         match waited {
-            Err(_) => eprintln!("AWDL helper did not stop in time."),
+            Err(_) => {
+                eprintln!("AWDL helper did not stop in time.");
+                crate::events::error("link", "The AirDrop helper did not stop in time; Wi-Fi may still be paused");
+            }
             Ok(_) if self.mode.is_empty() => {} // it never came up: nothing to undo
             // Killed or crashed before its teardown: Wi-Fi is still paused, OWL may still run.
             Ok(_) if !down => self.recover_after_crash().await,
@@ -364,7 +378,10 @@ impl Link {
             Ok(steps) if steps.is_empty() => eprintln!("Nothing was left to undo."),
             Ok(_) if self.mode == "borrow" => eprintln!("AWDL stopped, Wi-Fi restored."),
             Ok(_) => eprintln!("AWDL stopped."),
-            Err(e) => eprintln!("Could not undo it ({e}). Run `airdrop recover` to get Wi-Fi back."),
+            Err(e) => {
+                eprintln!("Could not undo it ({e}). Run `airdrop recover` to get Wi-Fi back.");
+                crate::events::error("link", "Could not undo the AirDrop session; Wi-Fi may still be paused");
+            }
         }
     }
 }
@@ -384,7 +401,10 @@ async fn watch_helper(mut lines: tokio::io::Lines<BufReader<ChildStdout>>, fail:
                         eprintln!("AWDL: {text}");
                         let _ = fail.send(Some(text));
                     }
-                    Some("warning") => eprintln!("AWDL: {text}"),
+                    Some("warning") => {
+                        eprintln!("AWDL: {text}");
+                        crate::events::emit("warning", serde_json::json!({ "message": text }));
+                    }
                     Some("prefer") => {
                         let _ = prefer.send(msg["channel"].as_u64().and_then(|c| u32::try_from(c).ok()));
                     }
