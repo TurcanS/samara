@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "airdrop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "airdrop-proto",
  "base64",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "airdrop-helper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "libc",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "airdrop-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
